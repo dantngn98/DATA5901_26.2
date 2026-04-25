@@ -1,3 +1,5 @@
 .venv
 .github
 .data
+.claude
+CLAUDE.md
