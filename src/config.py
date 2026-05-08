@@ -24,9 +24,13 @@ SHARE_MODELS_S3_PREFIX = f"{MODEL_DIR}/recovery_channel_share_softmax"  # per-ch
 
 # TODO: dataframe field names to reduce hard-coded strings?
 
+PREDICTIONS_S3_KEY = f"{MODEL_DIR}/predictions.parquet"
+
+
 class ContextKeys:
     DF_RECOVERY_LOADED = "df_recovery_loaded"
     DF_RECOVERY_PREPROCESSED = "df_recovery_preprocessed"
     CLF_MODEL = "clf_model"         # trained XGBClassifier (Stage 1)
     REG_MODEL = "reg_model"         # trained XGBRegressor (Stage 2)
     SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 9 per-channel share regressors
+    PREDICTIONS = "predictions"     # output Polars DataFrame from Predict step
