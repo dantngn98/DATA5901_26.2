@@ -15,9 +15,14 @@ from src.util import load
 
 @enforce({
     # ContextKeys.DF_RECOVERY_LOADED: Requires,  # not needed if loading saved preprocessed data
-    ContextKeys.DF_RECOVERY_PREPROCESSED: Sequence(Defines(strict=True), Locks(stict=True))
+    ContextKeys.DF_RECOVERY_PREPROCESSED: Sequence(Defines(strict=True), Locks(strict=True))
 })
 class Preprocess(PipelineStep):
+    """
+    Read raw recovery data from csv files, perform data cleaning,
+    group by hashed_fc-GL-week, and construct features.
+    Return the preprocessed DataFrame in context and optionally write to parquet for reuse in training and prediction steps.
+    """
     def __init__(self, read_from: str | None = None, write_to: str | None = None):
         self.read_from = read_from
         self.write_to = write_to

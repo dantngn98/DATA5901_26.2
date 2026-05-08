@@ -368,8 +368,7 @@ def _save_clf_to_s3(model: XGBClassifier, bucket: str, key: str) -> None:
     ContextKeys.CLF_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class TrainBinaryClassifier(PipelineStep):
-    """Pipeline step that trains (and optionally tunes) the Stage 1 XGBClassifier.
-
+    """
     Reads the preprocessed Polars DataFrame from context or from a parquet path,
     trains a binary classifier predicting P(prob_recovered > 0), saves the model
     to S3, and stores it in context under ContextKeys.CLF_MODEL.

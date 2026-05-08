@@ -5,7 +5,7 @@ from typing import Iterable
 import polars as pl
 
 def load(source: str | Iterable[str]) -> pl.DataFrame:
-    if isinstance(source, Iterable):
+    if not isinstance(source, str) and isinstance(source, Iterable):
         return pl.concat([
             load(fp) for fp in source
         ])

@@ -32,6 +32,7 @@ from src.pipeline_steps.train_binary_classifier_step import (
 from src.pipeline_steps.train_regressor_step import (
     _EXTENDED_FEATURE_COLS,
     _fill_site_gl_baseline,
+    _prob_mae,
     _sigmoid,
 )
 from src.pipeline_steps.train_per_channel_share_step import RECOVERY_CHANNELS
@@ -56,7 +57,16 @@ _SHAP_DEVIATION_FEATURE_NAMES: frozenset[str] = frozenset([
 # S3 helpers
 # ============================================================
 
+def _register_custom_metrics() -> None:
+    """Register custom XGBoost eval metrics in __main__ so joblib can unpickle
+    models that were saved from notebooks where these functions lived at top level."""
+    import __main__
+    if not hasattr(__main__, "prob_mae"):
+        __main__.prob_mae = _prob_mae
+
+
 def _load_model_from_s3(bucket: str, key: str):
+    _register_custom_metrics()
     s3_client = boto3.client("s3")
     with tempfile.TemporaryFile() as fp:
         s3_client.download_fileobj(bucket, key, fp)
@@ -94,6 +104,7 @@ def _resolve_models(
     clf_key: str,
     reg_key: str,
     share_prefix: str,
+    predict_channels: bool,
 ) -> tuple:
     if ContextKeys.CLF_MODEL in context:
         model_clf = context[ContextKeys.CLF_MODEL]
@@ -107,11 +118,14 @@ def _resolve_models(
     else:
         model_reg = _load_model_from_s3(S3_BUCKET, reg_key)
 
-    if ContextKeys.SHARE_MODELS in context:
-        share_models = context[ContextKeys.SHARE_MODELS]
-        logger.info("Share models loaded from context")
+    if predict_channels:
+        if ContextKeys.SHARE_MODELS in context:
+            share_models = context[ContextKeys.SHARE_MODELS]
+            logger.info("Share models loaded from context")
+        else:
+            share_models = _load_share_models_from_s3(S3_BUCKET, share_prefix)
     else:
-        share_models = _load_share_models_from_s3(S3_BUCKET, share_prefix)
+        share_models = {}
 
     return model_clf, model_reg, share_models
 
@@ -275,8 +289,7 @@ def _volume_bucket(vals: np.ndarray) -> list[str]:
     ContextKeys.PREDICTIONS: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class Predict(PipelineStep):
-    """Full three-stage inference step.
-
+    """
     Loads preprocessed data + all three model types (from context or S3),
     applies optional row filters (site / GL / year / week), runs Stage 1
     (classifier → p_nonzero), Stage 2 (regressor → e_rate), Stage 3
@@ -294,6 +307,7 @@ class Predict(PipelineStep):
         clf_model_s3_key: str | None = None,
         reg_model_s3_key: str | None = None,
         share_models_s3_prefix: str | None = None,
+        predict_channels: bool = True,
         sites: list[str] | None = None,
         gl_groups: list[str] | None = None,
         years: list[int] | None = None,
@@ -307,6 +321,7 @@ class Predict(PipelineStep):
         self.clf_model_s3_key = clf_model_s3_key or CLF_MODEL_S3_KEY
         self.reg_model_s3_key = reg_model_s3_key or REG_MODEL_S3_KEY
         self.share_models_s3_prefix = share_models_s3_prefix or SHARE_MODELS_S3_PREFIX
+        self.predict_channels = predict_channels
         self.sites = sites
         self.gl_groups = gl_groups
         self.years = years
@@ -329,6 +344,7 @@ class Predict(PipelineStep):
             self.clf_model_s3_key,
             self.reg_model_s3_key,
             self.share_models_s3_prefix,
+            predict_channels=self.predict_channels,
         )
 
         # 3. Filter to prediction scope
@@ -344,8 +360,11 @@ class Predict(PipelineStep):
         # 6. Combined recovery rate
         combined_rate = p_nonzero * e_rate
 
-        # 7. Stage 3: per-channel absolute recovery rates
-        channel_rates = _predict_stage3(share_models, df, combined_rate)
+        # 7. Stage 3: per-channel absolute recovery rates (skipped when predict_channels=False)
+        if self.predict_channels:
+            channel_rates = _predict_stage3(share_models, df, combined_rate)
+        else:
+            channel_rates = {}
 
         # 8. SHAP decomposition (optionally on a capped sample)
         shap_baseline_rate = np.full(len(df), np.nan)
@@ -377,8 +396,9 @@ class Predict(PipelineStep):
             pl.Series("combined_rate", combined_rate),
         ])
 
-        for channel in RECOVERY_CHANNELS:
-            out = out.with_columns(pl.Series(f"pred_{channel}", channel_rates[channel]))
+        if self.predict_channels:
+            for channel in RECOVERY_CHANNELS:
+                out = out.with_columns(pl.Series(f"pred_{channel}", channel_rates[channel]))
 
         out = out.with_columns([
             pl.Series("shap_baseline_rate", shap_baseline_rate),
@@ -399,14 +419,15 @@ class Predict(PipelineStep):
                 pl.Series("prob_recovered", y_true),
                 pl.Series("abs_err", np.abs(combined_rate - y_true)),
             ])
-            for channel in RECOVERY_CHANNELS:
-                if channel in df.columns:
-                    out = out.with_columns(
-                        pl.Series(
-                            f"abs_err_{channel}",
-                            np.abs(channel_rates[channel] - df[channel].to_numpy()),
+            if self.predict_channels:
+                for channel in RECOVERY_CHANNELS:
+                    if channel in df.columns:
+                        out = out.with_columns(
+                            pl.Series(
+                                f"abs_err_{channel}",
+                                np.abs(channel_rates[channel] - df[channel].to_numpy()),
+                            )
                         )
-                    )
 
         context[ContextKeys.PREDICTIONS] = out
         context.lock(ContextKeys.PREDICTIONS)

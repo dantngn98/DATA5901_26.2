@@ -344,11 +344,10 @@ def _save_reg_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
     ContextKeys.REG_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class TrainRegressor(PipelineStep):
-    """Pipeline step that trains (and optionally tunes) the Stage 2 XGBRegressor.
-
-    Operates on non-zero recovery rows only. Computes site × GL baseline features
+    """
+    Operates on non-zero recovery rows only. Computes site - GL baseline features
     from training data, persists them on the model object as `site_gl_baseline_` and
-    `baseline_priors_` (matching the tuning notebook contract), saves to S3, and
+    `baseline_priors_`, saves to S3, and
     stores the model in context under ContextKeys.REG_MODEL.
     """
 
