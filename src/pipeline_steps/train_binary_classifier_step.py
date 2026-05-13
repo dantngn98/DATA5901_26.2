@@ -226,6 +226,7 @@ _DEFAULT_CLF_PARAMS: dict = {
     "max_delta_step": 0,
 }
 
+# TODO: config
 _DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
 _DEFAULT_TEST_YEARS: list[int] = [2025]
 
@@ -345,7 +346,7 @@ def _train_final_model(
     logger.info("Stage 1 final model: best_iteration=%d", model.best_iteration)
     return model
 
-
+# TODO: implement these as load/write utils
 def _save_clf_to_s3(model: XGBClassifier, bucket: str, key: str) -> None:
     s3_client = boto3.client("s3")
     try:
@@ -358,18 +359,41 @@ def _save_clf_to_s3(model: XGBClassifier, bucket: str, key: str) -> None:
         logger.exception("Failed to save classifier to s3://%s/%s", bucket, key)
         raise
 
+def _load_clf_from_s3(bucket: str, key: str) -> XGBClassifier:
+    s3_client = boto3.client("s3")
+    try:
+        with tempfile.TemporaryFile() as fp:
+            s3_client.download_fileobj(bucket, key, fp)
+            fp.seek(0)
+
+            model = joblib.load(fp)
+
+            if not isinstance(model, XGBClassifier):
+                raise ValueError("Object loaded from s3://%s/%s is not an instance of XGBClassifier")
+
+            logger.info("Classifier loaded from s3://%s/%s", bucket, key)
+            return model
+
+    except Exception:
+        logger.exception(
+            "Failed to load classifier from s3://%s/%s",
+            bucket,
+            key,
+        )
+        raise
+
 
 # ============================================================
 # Pipeline step
 # ============================================================
 
 @enforce({
-    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from makes it optional
+    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from_key makes it optional
     ContextKeys.CLF_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class TrainBinaryClassifier(PipelineStep):
     """
-    Reads the preprocessed Polars DataFrame from context or from a parquet path,
+    Reads the preprocessed Polars DataFrame from context,
     trains a binary classifier predicting P(prob_recovered > 0), saves the model
     to S3, and stores it in context under ContextKeys.CLF_MODEL.
     """
@@ -380,42 +404,43 @@ class TrainBinaryClassifier(PipelineStep):
         n_trials: int = 50,
         train_years: list[int] | None = None,
         test_years: list[int] | None = None,
-        read_from: str | None = None,
+        read_from_key: str | None = None,
         save_to_key: str | None = None,
     ):
         self.tune = tune
         self.n_trials = n_trials
         self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
         self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
-        self.read_from = read_from
-        self.save_to_key = save_to_key or CLF_MODEL_S3_KEY
+        self.read_from_key = read_from_key
+        self.save_to_key = save_to_key
 
     def __call__(self, context: Context) -> Context:
-        if self.read_from is not None:
-            df = load(self.read_from)
+        if self.read_from_key is not None:
+            model = _load_clf_from_s3(model, S3_BUCKET, self.read_from_key)
         else:
             df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
-        X_train, X_val, y_train, y_val, scale_pos_weight = _build_train_val_splits(
-            df, self.train_years, self.test_years
-        )
+            X_train, X_val, y_train, y_val, scale_pos_weight = _build_train_val_splits(
+                df, self.train_years, self.test_years
+            )
 
-        if self.tune:
-            best_params = _tune_with_optuna(
+            if self.tune:
+                best_params = _tune_with_optuna(
+                    X_train, X_val, y_train, y_val,
+                    scale_pos_weight=scale_pos_weight,
+                    n_trials=self.n_trials,
+                )
+            else:
+                best_params = _DEFAULT_CLF_PARAMS
+
+            model = _train_final_model(
                 X_train, X_val, y_train, y_val,
                 scale_pos_weight=scale_pos_weight,
-                n_trials=self.n_trials,
+                best_params=best_params,
             )
-        else:
-            best_params = _DEFAULT_CLF_PARAMS
 
-        model = _train_final_model(
-            X_train, X_val, y_train, y_val,
-            scale_pos_weight=scale_pos_weight,
-            best_params=best_params,
-        )
-
-        _save_clf_to_s3(model, S3_BUCKET, self.save_to_key)
+        if self.save_to_key is not None:
+            _save_clf_to_s3(model, S3_BUCKET, self.save_to_key)
 
         context[ContextKeys.CLF_MODEL] = model
         context.lock(ContextKeys.CLF_MODEL)

@@ -334,6 +334,7 @@ def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
         logger.exception("Failed to save channel-share model to s3://%s/%s", bucket, key)
         raise
 
+# TODO: load models, not preprocessed df
 
 # ============================================================
 # Pipeline step

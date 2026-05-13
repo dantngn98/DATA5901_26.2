@@ -334,6 +334,29 @@ def _save_reg_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
         logger.exception("Failed to save regressor to s3://%s/%s", bucket, key)
         raise
 
+def _load_reg_from_s3(bucket: str, key: str) -> XGBRegressor:
+    s3_client = boto3.client("s3")
+    try:
+        with tempfile.TemporaryFile() as fp:
+            s3_client.download_fileobj(bucket, key, fp)
+            fp.seek(0)
+
+            model = joblib.load(fp)
+
+            if not isinstance(model, XGBRegressor):
+                raise ValueError("Object loaded from s3://%s/%s is not an instance of XGBRegressor")
+
+            logger.info("Classifier loaded from s3://%s/%s", bucket, key)
+            return model
+
+    except Exception:
+        logger.exception(
+            "Failed to load classifier from s3://%s/%s",
+            bucket,
+            key,
+        )
+        raise
+
 
 # ============================================================
 # Pipeline step
@@ -359,7 +382,7 @@ class TrainRegressor(PipelineStep):
         test_years: list[int] | None = None,
         holdout_frac: float = 0.05,
         holdout_seed: int = 42,
-        read_from: str | None = None,
+        read_from_key: str | None = None,
         save_to_key: str | None = None,
     ):
         self.tune = tune
@@ -368,39 +391,40 @@ class TrainRegressor(PipelineStep):
         self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
         self.holdout_frac = holdout_frac
         self.holdout_seed = holdout_seed
-        self.read_from = read_from
-        self.save_to_key = save_to_key or REG_MODEL_S3_KEY
+        self.read_from_key = read_from_key
+        self.save_to_key = save_to_key
 
     def __call__(self, context: Context) -> Context:
-        if self.read_from is not None:
-            df = load(self.read_from)
+        if self.read_from_key is not None:
+            model = _load_reg_from_s3(S3_BUCKET, self.read_from_key)
         else:
             df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
-        X_train, X_val, y_train, y_val, site_gl_baseline, priors = _build_train_val_splits(
-            df,
-            train_years=self.train_years,
-            test_years=self.test_years,
-            holdout_frac=self.holdout_frac,
-            holdout_seed=self.holdout_seed,
-        )
-
-        if self.tune:
-            best_params = _tune_with_optuna(
-                X_train, X_val, y_train, y_val,
-                n_trials=self.n_trials,
+            X_train, X_val, y_train, y_val, site_gl_baseline, priors = _build_train_val_splits(
+                df,
+                train_years=self.train_years,
+                test_years=self.test_years,
+                holdout_frac=self.holdout_frac,
+                holdout_seed=self.holdout_seed,
             )
-        else:
-            best_params = _DEFAULT_REG_PARAMS
 
-        model = _train_final_model(X_train, X_val, y_train, y_val, best_params)
+            if self.tune:
+                best_params = _tune_with_optuna(
+                    X_train, X_val, y_train, y_val,
+                    n_trials=self.n_trials,
+                )
+            else:
+                best_params = _DEFAULT_REG_PARAMS
 
-        # Persist baseline data on the model so downstream steps and evaluation
-        # notebooks can load it without re-reading training data.
-        model.site_gl_baseline_ = site_gl_baseline
-        model.baseline_priors_ = priors
+            model = _train_final_model(X_train, X_val, y_train, y_val, best_params)
 
-        _save_reg_to_s3(model, S3_BUCKET, self.save_to_key)
+            # Persist baseline data on the model so downstream steps and evaluation
+            # notebooks can load it without re-reading training data.
+            model.site_gl_baseline_ = site_gl_baseline  # TODO: write these as context variables (unless it's important for it to be stored w/ model params)
+            model.baseline_priors_ = priors
+
+        if self.save_to_key is not None:
+            _save_reg_to_s3(model, S3_BUCKET, self.save_to_key)
 
         context[ContextKeys.REG_MODEL] = model
         context.lock(ContextKeys.REG_MODEL)

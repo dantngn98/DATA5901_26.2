@@ -65,6 +65,8 @@ def _register_custom_metrics() -> None:
         __main__.prob_mae = _prob_mae
 
 
+# TODO: move these helpers to a util so they can be used in other places
+
 def _load_model_from_s3(bucket: str, key: str):
     _register_custom_metrics()
     s3_client = boto3.client("s3")
