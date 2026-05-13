@@ -7,8 +7,10 @@ import tempfile
 import boto3
 import joblib
 import numpy as np
+import optuna
 import pandas as pd
 import polars as pl
+from optuna.integration import XGBoostPruningCallback
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
@@ -179,19 +181,17 @@ _BASELINE_COLS: list[str] = [
 
 _EPS = 1e-7
 
+# Default hyperparameters used when tune=False. Matches the search-space
+# midpoints so the untuned baseline is a reasonable starting point.
 _DEFAULT_REG_PARAMS: dict = {
-    "n_estimators": 500,
     "max_depth": 5,
     "learning_rate": 0.15,
     "subsample": 0.7,
     "colsample_bytree": 0.7,
-    "early_stopping_rounds": 30,
-    "tree_method": "hist",
-    "enable_categorical": True,
-    "random_state": 42,
-    "verbosity": 0,
-    "eval_metric": "mae",
-    "n_jobs": -1,
+    "min_child_weight": 5,
+    "gamma": 0.1,
+    "reg_alpha": 0.01,
+    "reg_lambda": 1.0,
 }
 
 _DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
@@ -209,6 +209,16 @@ def _logit(p: np.ndarray) -> np.ndarray:
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1 / (1 + np.exp(-x))
+
+
+def _prob_mae(y_pred: np.ndarray, y_true: np.ndarray) -> float:
+    """Custom XGBoost eval metric: MAE in original probability space."""
+    return float(np.mean(np.abs(_sigmoid(y_pred) - _sigmoid(y_true))))
+
+# XGBoost names the eval metric column after func.__name__; set it explicitly so the
+# pruner callback key "validation_0-prob_mae" matches regardless of how this function
+# is imported or renamed.
+_prob_mae.__name__ = "prob_mae"
 
 
 def _cast_categoricals(df: pd.DataFrame) -> pd.DataFrame:
@@ -297,20 +307,80 @@ def _build_channel_splits(
 
 
 # ============================================================
-# Per-channel training
+# Per-channel tuning + training
 # ============================================================
 
-def _train_channel_model(
+def _tune_with_optuna(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     y_train: np.ndarray,
     y_test: np.ndarray,
-    params: dict,
-) -> tuple[XGBRegressor, dict]:
-    y_train_lg = _logit(np.clip(y_train, _EPS, 1 - _EPS))
-    y_test_lg  = _logit(np.clip(y_test,  _EPS, 1 - _EPS))
+    n_trials: int,
+    channel: str,
+) -> dict:
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    model = XGBRegressor(**params)
+    y_train_lg = _logit(y_train)
+    y_test_lg  = _logit(y_test)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "objective": "reg:squarederror",
+            "tree_method": "hist",
+            "enable_categorical": True,
+            "random_state": 42,
+            "n_estimators": 500,
+            "early_stopping_rounds": 30,
+            "eval_metric": _prob_mae,
+            "callbacks": [XGBoostPruningCallback(trial, "validation_0-prob_mae")],
+            "max_depth":        trial.suggest_int("max_depth", 3, 8),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 50),
+            "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        }
+        model = XGBRegressor(**params)
+        model.fit(X_train, y_train_lg, eval_set=[(X_test, y_test_lg)], verbose=False)
+        preds = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
+        return float(mean_absolute_error(y_test, preds))
+
+    study = optuna.create_study(
+        direction="minimize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10, interval_steps=5),
+        study_name=f"xgb_stage3_share_{channel}",
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    logger.info(
+        "Optuna Stage 3 channel '%s' complete: best MAE=%.4f, params=%s",
+        channel, study.best_value, study.best_params,
+    )
+    return study.best_params
+
+
+def _train_final_model(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: np.ndarray,
+    y_test: np.ndarray,
+    best_params: dict,
+) -> tuple[XGBRegressor, dict]:
+    y_train_lg = _logit(y_train)
+    y_test_lg  = _logit(y_test)
+
+    model = XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=2000,
+        tree_method="hist",
+        enable_categorical=True,
+        random_state=42,
+        early_stopping_rounds=50,
+        eval_metric=_prob_mae,
+        **best_params,
+    )
     model.fit(X_train, y_train_lg, eval_set=[(X_test, y_test_lg)], verbose=False)
 
     pred = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
@@ -344,15 +414,19 @@ def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
     ContextKeys.SHARE_MODELS: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class TrainPerChannelShareRegressors(PipelineStep):
-    """Pipeline step that trains 9 per-channel share regressors used for softmax allocation.
+    """Pipeline step that trains (and optionally tunes) the Stage 3 per-channel share regressors.
 
     For each recovery channel, fits an XGBRegressor on logit(share) where
     share = prob_<channel> / prob_recovered, on rows with prob_recovered > 0.
+    When tune=True, a separate Optuna study is run per channel (one study per
+    regressor, mirroring the one-study-per-stage pattern of the other Train
+    steps); when tune=False, _DEFAULT_REG_PARAMS is used for all 9 channels.
+
     Each model carries `site_gl_baseline_`, `aug_features_`, `channel_`, and
     `metrics_` so that downstream inference can recover everything from the
-    single artifact. Models are saved to S3 under SHARE_MODELS_S3_PREFIX and
-    stored in context under ContextKeys.SHARE_MODELS as a dict keyed by
-    channel name.
+    single artifact. Models are saved to S3 under SHARE_MODELS_S3_PREFIX
+    (one .joblib per channel) and stored in context under
+    ContextKeys.SHARE_MODELS as a dict keyed by channel name.
 
     Softmax normalisation across channels and combination with the Stage-1
     p_recovered_hat prediction happen at inference, not in this step.
@@ -360,11 +434,15 @@ class TrainPerChannelShareRegressors(PipelineStep):
 
     def __init__(
         self,
+        tune: bool = False,
+        n_trials: int = 50,
         train_years: list[int] | None = None,
         test_years: list[int] | None = None,
         read_from: str | None = None,
         save_to_prefix: str | None = None,
     ):
+        self.tune = tune
+        self.n_trials = n_trials
         self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
         self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
         self.read_from = read_from
@@ -386,8 +464,8 @@ class TrainPerChannelShareRegressors(PipelineStep):
         prefix = self.save_to_prefix.rstrip("/")
         for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
             logger.info(
-                "[%d/%d] Training share regressor for channel '%s'",
-                i, len(RECOVERY_CHANNELS), channel,
+                "[%d/%d] Training share regressor for channel '%s' (tune=%s)",
+                i, len(RECOVERY_CHANNELS), channel, self.tune,
             )
 
             X_train, X_test, y_train, y_test, site_gl_baseline, aug_features = (
@@ -400,8 +478,17 @@ class TrainPerChannelShareRegressors(PipelineStep):
                 )
             )
 
-            model, metrics = _train_channel_model(
-                X_train, X_test, y_train, y_test, _DEFAULT_REG_PARAMS,
+            if self.tune:
+                best_params = _tune_with_optuna(
+                    X_train, X_test, y_train, y_test,
+                    n_trials=self.n_trials,
+                    channel=channel,
+                )
+            else:
+                best_params = _DEFAULT_REG_PARAMS
+
+            model, metrics = _train_final_model(
+                X_train, X_test, y_train, y_test, best_params,
             )
             logger.info(
                 "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
@@ -415,7 +502,7 @@ class TrainPerChannelShareRegressors(PipelineStep):
             model.channel_ = channel
             model.metrics_ = metrics
 
-            _save_model_to_s3(model, S3_BUCKET, f"{prefix}/{channel}_share.joblib")
+            _save_model_to_s3(model, S3_BUCKET, f"{prefix}/{channel}.joblib")
 
             share_models[channel] = model
 
