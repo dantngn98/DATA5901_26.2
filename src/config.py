@@ -17,7 +17,7 @@ S3_BUCKET = "msds-26.2-data"       # raw bucket name (no "s3://" prefix) for bot
 MODEL_DIR = "model"                 # S3 key prefix for saved models
 CLF_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_classification_model.joblib"
 REG_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_regression_model.joblib"
-SHARE_MODELS_S3_PREFIX = f"{MODEL_DIR}/recovery_channel_share_softmax"  # per-channel share regressors live under this prefix
+SHARE_MODELS_S3_PREFIX = f"{MODEL_DIR}/tuned_xgboost_share_regressors"  # per-channel share regressors live under this prefix
 
 
 # === field names ===
