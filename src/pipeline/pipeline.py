@@ -19,8 +19,7 @@ class Pipeline[Context]:
     def __call__(self, context: Context) -> Context:
         c = context
         for step in self.pipeline:
-            if step:
-                c = step(c)
+            c = step(c)
         return c
 
     def extend(self, *steps: PipelineStep):
