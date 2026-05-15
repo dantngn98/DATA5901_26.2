@@ -220,6 +220,21 @@ class WeightedDigraph[K: Hashable]:
             raise ValueError(f"end vertex {end} does not exist")
         return len(from_end)
 
+    def reverse(self, inplace: bool = False) -> Self:
+        if inplace:
+            self._out_edges, self._in_edges = self._in_edges, self._out_edges
+            G = self
+        else:
+            G = WeightedDigraph(self.default_vertex_attributes, self.default_edge_attributes)
+            
+            for vertex in self.vertices():
+                G.add_vertex(vertex.id, **vertex.attributes, allow_exists=False)
+            
+            for edge in self.edges():
+                G.add_edge(edge.start.id, edge.end.id, allow_create_vertices=False, **edge.attributes)
+        
+        return G
+
     @classmethod
     def from_dict[K: Hashable](
         cls,

@@ -413,6 +413,103 @@ def test_edge_attributes_are_immutable():
 
 
 # =========================================================
+# reverse
+# =========================================================
+def test_reverse_non_inplace_structure():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=1)
+    g.add_edge("B", "A", weight=2)
+
+    r = g.reverse(inplace=False)
+
+    # original unchanged
+    assert g.contains_edge("A", "B")
+    assert g.contains_edge("B", "A")
+
+    # reversed edges
+    assert r.contains_edge("B", "A")
+    assert r.contains_edge("A", "B")
+
+    # attributes preserved but direction flipped
+    e1 = r.get_edge("B", "A")
+    e2 = r.get_edge("A", "B")
+
+    assert e1.attributes["weight"] == 1
+    assert e2.attributes["weight"] == 2
+
+def test_reverse_creates_new_graph_object():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_edge("A", "B")
+
+    r = g.reverse(inplace=False)
+
+    assert r is not g
+    assert isinstance(r, WeightedDigraph)
+
+def test_reverse_inplace_mutates_graph():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_edge("A", "B", weight=10)
+
+    original_id = id(g)
+
+    r = g.reverse(inplace=True)
+
+    # same object returned
+    assert r is g
+    assert id(g) == original_id
+
+    # direction flipped
+    assert g.contains_edge("B", "A")
+    assert not g.contains_edge("A", "B")
+
+    e = g.get_edge("B", "A")
+    assert e.attributes["weight"] == 10
+
+def test_reverse_preserves_vertices():
+    g = WeightedDigraph()
+
+    g.add_vertex("A", color="red")
+    g.add_vertex("B", color="blue")
+
+    r = g.reverse()
+
+    assert r.contains_vertex("A")
+    assert r.contains_vertex("B")
+
+    assert r.get_vertex("A").attributes["color"] == "red"
+    assert r.get_vertex("B").attributes["color"] == "blue"
+
+def test_reverse_degree_swap_property():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_vertex("C")
+
+    g.add_edge("A", "B")
+    g.add_edge("A", "C")
+    g.add_edge("B", "C")
+
+    r = g.reverse()
+
+    # out-degree becomes in-degree
+    assert r.out_degree("A") == g.in_degree("A")
+    assert r.in_degree("A") == g.out_degree("A")
+
+    assert r.out_degree("C") == g.in_degree("C")
+    assert r.in_degree("C") == g.out_degree("C")
+
+# =========================================================
 # from_dict
 # =========================================================
 
