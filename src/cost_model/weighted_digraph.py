@@ -104,7 +104,7 @@ class WeightedDigraph[K: Hashable]:
         return end in self._out_edges.get(start, ())
 
     @_check_invariant
-    def add_edge(self, start: K, end: K, /, allow_create_vertices: bool = False, allow_overwrite: bool = False, **kwargs) -> bool:
+    def add_edge(self, start: K, end: K, /, allow_create_vertices: bool = False, allow_update: bool = False, **kwargs) -> bool:
         if allow_create_vertices:
             # create vertices if they don't already exist
             if not self.contains_vertex(start):
@@ -124,7 +124,7 @@ class WeightedDigraph[K: Hashable]:
         
         edge_attributes = self._out_edges.get(start, {}).get(end)
         edge_exists = edge_attributes is not None
-        if not allow_overwrite and edge_exists:
+        if not allow_update and edge_exists:
             raise ValueError(f"edge from {start} to {end} already exists")
         if not edge_exists:
             edge_attributes = {
@@ -133,8 +133,7 @@ class WeightedDigraph[K: Hashable]:
             }
             self._out_edges[start][end] = edge_attributes  # shared reference => only need to modify one
             self._in_edges[end][start] = edge_attributes
-        else:  # overwrite
-            edge_attributes.clear()
+        else:  # update
             edge_attributes.update(kwargs)
 
         return not edge_exists
@@ -226,19 +225,45 @@ class WeightedDigraph[K: Hashable]:
             raise ValueError(f"end vertex {end} does not exist")
         return len(from_end)
 
+    def copy(self) -> Self:
+        G = WeightedDigraph()
+
+        G.default_vertex_attributes = self.default_vertex_attributes  # immutable, so shared reference is fine
+        G.default_edge_attributes = self.default_edge_attributes
+
+        G._vertices = {vertex: attributes.copy() for vertex, attributes in self._vertices.items()}
+        G._out_edges = {
+            start: {end: attributes.copy() for end, attributes in end_attributes.items()}
+            for start, end_attributes in self._out_edges.items()
+        }
+        G._in_edges = {  # G._in_edges[end][start] = G._out_edges[start][end]
+            # shared edge attribute reference between _out_edges and _in_edges
+            end: {start: G._out_edges[start][end] for start in start_attributes.keys()}
+            for end, start_attributes in self._in_edges.items()
+        }
+
+        return G
+
     def reverse(self, inplace: bool = False) -> Self:
         if inplace:
             self._out_edges, self._in_edges = self._in_edges, self._out_edges
             G = self
         else:
-            G = WeightedDigraph(self.default_vertex_attributes, self.default_edge_attributes)
-            
-            for vertex in self.vertices():
-                G.add_vertex(vertex.id, **vertex.attributes, allow_exists=False)
-            
-            for edge in self.edges():
-                G.add_edge(edge.end.id, edge.start.id, allow_create_vertices=False, **edge.attributes)
-        
+            G = WeightedDigraph()
+
+            G.default_vertex_attributes = self.default_vertex_attributes
+            G.default_edge_attributes = self.default_edge_attributes
+
+            G._vertices = {vertex: attributes.copy() for vertex, attributes in self._vertices.items()}
+            G._out_edges = {  # G._out_edges[u][v] = self._out_edges[v][u] = self._in_edges[u][v]
+                u: {v: attributes.copy() for v, attributes in v_attributes.items()}
+                for u, v_attributes in self._in_edges.items()
+            }
+            G._in_edges = {  # G._in_edges[u][v] = G._out_edges[v][u] = self._out_edges[u][v]
+                u: {v: G._out_edges[v][u] for v in v_attributes.keys()}
+                for u, v_attributes in self._out_edges.items()
+            }
+
         return G
 
     def freeze(self) -> _FrozenWeightedDigraph[K]:
