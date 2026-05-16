@@ -1,6 +1,5 @@
 # standard
 from collections.abc import Hashable, Iterable
-from copy import deepcopy
 from dataclasses import dataclass
 from functools import wraps
 from types import MappingProxyType
@@ -19,7 +18,7 @@ class Edge[K]:
     attributes: MappingProxyType[str, Any]
 
 class WeightedDigraph[K: Hashable]:
-    _DEBUG = True
+    _DEBUG = False
 
     __slots__ = ("default_vertex_attributes", "default_edge_attributes", "_vertices", "_out_edges", "_in_edges")
 
@@ -28,8 +27,8 @@ class WeightedDigraph[K: Hashable]:
         default_vertex_attributes: dict[str, Any] | None = None,
         default_edge_attributes: dict[str, Any] | None = None
     ):
-        self.default_vertex_attributes = MappingProxyType(deepcopy(default_vertex_attributes or {}))
-        self.default_edge_attributes = MappingProxyType(deepcopy(default_edge_attributes or {}))
+        self.default_vertex_attributes = MappingProxyType(default_vertex_attributes.copy() if default_vertex_attributes else {})
+        self.default_edge_attributes = MappingProxyType(default_edge_attributes.copy() if default_edge_attributes else {})
 
         # vertex -> vertex attributes
         self._vertices: dict[K, dict[str, Any]] = {}
@@ -149,8 +148,13 @@ class WeightedDigraph[K: Hashable]:
 
     @_check_invariant
     def remove_edge(self, start: K, end: K, allow_not_exists: bool = False) -> bool:
-        from_start = self._out_edges.get(start)
-        edge_exists = from_start is not None and end in from_start
+        if not self.contains_vertex(start):
+            raise ValueError(f"start vertex {start} does not exist")
+        if not self.contains_vertex(end):
+            raise ValueError(f"end vertex {end} does not exist")
+        
+        from_start = self._out_edges[start]
+        edge_exists = end in from_start
         if not edge_exists and not allow_not_exists:
             raise ValueError(f"no edge from {start} to {end}")
         elif edge_exists:
@@ -161,6 +165,7 @@ class WeightedDigraph[K: Hashable]:
             removed = False
         return removed
 
+    # ! live view of attributes
     def get_vertex(self, vertex: K) -> Vertex[K] | None:
         attributes = self._vertices.get(vertex)
         return Vertex(vertex, MappingProxyType(attributes)) if attributes is not None else None
@@ -169,6 +174,7 @@ class WeightedDigraph[K: Hashable]:
         for vertex, attributes in self._vertices.items():
             yield Vertex(vertex, MappingProxyType(attributes))
     
+    # ! live view of attributes
     def get_edge(self, start: K, end: K) -> Edge[K] | None:
         from_start = self._out_edges.get(start)
         if from_start is None:
@@ -231,32 +237,45 @@ class WeightedDigraph[K: Hashable]:
                 G.add_vertex(vertex.id, **vertex.attributes, allow_exists=False)
             
             for edge in self.edges():
-                G.add_edge(edge.start.id, edge.end.id, allow_create_vertices=False, **edge.attributes)
+                G.add_edge(edge.end.id, edge.start.id, allow_create_vertices=False, **edge.attributes)
         
         return G
+
+    def freeze(self) -> _FrozenWeightedDigraph[K]:
+        return _FrozenWeightedDigraph(self)
 
     @classmethod
     def from_dict[K: Hashable](
         cls,
-        vertex_attributes: dict[K, dict[str, Any]],
-        start_end_attributes: dict[K, dict[K, dict[str, Any]]],
+        edges: dict[K, list[K] | dict[K, dict[str, Any]]],
+        vertex_attributes: dict[K, dict[str, Any]] | None = None,
         default_vertex_attributes: dict[str, Any] | None = None,
         default_edge_attributes: dict[str, Any] | None = None
     ) -> Self:
+        vertex_attributes = vertex_attributes if vertex_attributes is not None else {}
+
         G = cls(default_vertex_attributes, default_edge_attributes)
 
-        # create vertices without edges
+        # create vertices (even those without edges)
         for vertex, attributes in vertex_attributes.items():
             G.add_vertex(vertex, allow_exists=False, **attributes)
 
         # ensure vertices in edges, create edges
-        for start, end_attributes in start_end_attributes.items():
-            G.add_vertex(start, allow_exists=True, **vertex_attributes[start])
-            for end, attributes in end_attributes.items():
-                G.add_vertex(end, allow_exists=True, **vertex_attributes[end])
-                G.add_edge(start, end, allow_create_vertices=False, **attributes)
+        for start, end_list_or_dict in edges.items():
+            G.add_vertex(start, allow_exists=True, **vertex_attributes.get(start, {}))
+
+            if isinstance(end_list_or_dict, list):
+                for end in end_list_or_dict:
+                    G.add_vertex(end, allow_exists=True)
+                    G.add_edge(start, end, allow_create_vertices=False)
+            else:
+                assert isinstance(end_list_or_dict, dict)
+                for end, attributes in end_list_or_dict.items():
+                    G.add_vertex(end, allow_exists=True, **vertex_attributes.get(end, {}))
+                    G.add_edge(start, end, allow_create_vertices=False, **attributes)
         
         return G
+
 
     #===================================
     # private implementations/helpers
@@ -284,3 +303,75 @@ class WeightedDigraph[K: Hashable]:
         }
         self._out_edges[vertex] = {}
         self._in_edges[vertex] = {}
+
+
+class _FrozenWeightedDigraph[K: Hashable]:
+    __slots__ = ("_vertices", "_out_edges", "_in_edges")
+
+    def __init__(self, G: WeightedDigraph[K]):
+        self._vertices: dict[K, Vertex[K]] = {
+            vertex.id: Vertex(vertex.id, MappingProxyType(dict(vertex.attributes)))
+            for vertex in G.vertices()
+        }
+
+        self._out_edges: dict[K, dict[K, Edge[K]]] = {vertex_id: {} for vertex_id in self._vertices.keys()}
+        self._in_edges: dict[K, dict[K, Edge[K]]] = {vertex_id: {} for vertex_id in self._vertices.keys()}
+        for edge in G.edges():
+            edge_copy = Edge(self._vertices[edge.start.id], self._vertices[edge.end.id], MappingProxyType(dict(edge.attributes)))
+            self._out_edges[edge.start.id][edge.end.id] = edge_copy
+            self._in_edges[edge.end.id][edge.start.id] = edge_copy
+
+
+    def contains_vertex(self, vertex: K) -> bool:
+        return vertex in self._vertices
+    
+    def contains_edge(self, start: K, end: K) -> bool:
+        return end in self._out_edges.get(start, ())
+
+    def get_vertex(self, vertex: K) -> Vertex[K] | None:
+        return self._vertices.get(vertex)
+
+    def vertices(self) -> Iterable[Vertex[K]]:
+        return (vertex for vertex in self._vertices.values())
+    
+    def get_edge(self, start: K, end: K) -> Edge[K] | None:
+        from_start = self._out_edges.get(start)
+        if from_start is None:
+            raise ValueError(f"start vertex {start} does not exist")
+        
+        edge = from_start.get(end)
+        if edge is None and not self.contains_vertex(end):
+            raise ValueError(f"end vertex {end} does not exist")
+        
+        return edge
+
+    def edges(self) -> Iterable[Edge[K]]:
+        for end_edge in self._out_edges.values():
+            for edge in end_edge.values():
+                yield edge
+
+    def out_edges(self, start: K) -> Iterable[Edge[K]]:
+        from_start = self._out_edges.get(start)
+        if from_start is None:
+            raise ValueError(f"start vertex {start} does not exist")
+        for edge in from_start.values():
+            yield edge
+    
+    def in_edges(self, end: K) -> Iterable[Edge[K]]:
+        from_end = self._in_edges.get(end)
+        if from_end is None:
+            raise ValueError(f"end vertex {end} does not exist")
+        for edge in from_end.values():
+            yield edge
+
+    def out_degree(self, start: K) -> int:
+        from_start = self._out_edges.get(start)
+        if from_start is None:
+            raise ValueError(f"start vertex {start} does not exist")
+        return len(from_start)
+
+    def in_degree(self, end: K) -> int:
+        from_end = self._in_edges.get(end)
+        if from_end is None:
+            raise ValueError(f"end vertex {end} does not exist")
+        return len(from_end)

@@ -243,6 +243,9 @@ def test_remove_edge():
 def test_remove_missing_edge_raises():
     g = WeightedDigraph()
 
+    g.add_vertex("A")
+    g.add_vertex("B")
+
     with pytest.raises(ValueError):
         g.remove_edge("A", "B")
 
@@ -250,9 +253,19 @@ def test_remove_missing_edge_raises():
 def test_remove_missing_edge_allowed():
     g = WeightedDigraph()
 
+    g.add_vertex("A")
+    g.add_vertex("B")
+
     removed = g.remove_edge("A", "B", allow_not_exists=True)
 
     assert removed is False
+
+
+def test_remove_edge_missing_vertices_raises():
+    g = WeightedDigraph()
+
+    with pytest.raises(ValueError):
+        g.remove_edge("A", "B", allow_not_exists=True)
 
 
 # =========================================================
@@ -415,6 +428,7 @@ def test_edge_attributes_are_immutable():
 # =========================================================
 # reverse
 # =========================================================
+
 def test_reverse_non_inplace_structure():
     g = WeightedDigraph()
 
@@ -520,7 +534,7 @@ def test_from_dict():
             "B": {"color": "blue"},
             "C": {},
         },
-        start_end_attributes={
+        edges={
             "A": {
                 "B": {"weight": 5},
             },
@@ -547,7 +561,7 @@ def test_from_dict_supports_isolated_vertices():
             "A": {},
             "B": {},
         },
-        start_end_attributes={},
+        edges={},
     )
 
     assert g.contains_vertex("A")
@@ -557,13 +571,275 @@ def test_from_dict_supports_isolated_vertices():
 
 
 # =========================================================
+# freeze / frozen graph
+# =========================================================
+
+def test_freeze_returns_frozen_graph():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_edge("A", "B", weight=5)
+
+    frozen = g.freeze()
+
+    assert frozen is not g
+
+    assert frozen.contains_vertex("A")
+    assert frozen.contains_vertex("B")
+
+    assert frozen.contains_edge("A", "B")
+
+
+def test_freeze_preserves_vertex_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A", color="red", size=10)
+
+    frozen = g.freeze()
+
+    v = frozen.get_vertex("A")
+
+    assert v.attributes["color"] == "red"
+    assert v.attributes["size"] == 10
+
+
+def test_freeze_preserves_edge_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=7, cost=99)
+
+    frozen = g.freeze()
+
+    e = frozen.get_edge("A", "B")
+
+    assert e.attributes["weight"] == 7
+    assert e.attributes["cost"] == 99
+
+
+def test_freeze_vertex_attributes_are_immutable():
+    g = WeightedDigraph()
+
+    g.add_vertex("A", value=1)
+
+    frozen = g.freeze()
+
+    v = frozen.get_vertex("A")
+
+    with pytest.raises(TypeError):
+        v.attributes["value"] = 2
+
+
+def test_freeze_edge_attributes_are_immutable():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=1)
+
+    frozen = g.freeze()
+
+    e = frozen.get_edge("A", "B")
+
+    with pytest.raises(TypeError):
+        e.attributes["weight"] = 2
+
+
+def test_freeze_is_snapshot_not_live_view_vertex_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A", color="red")
+
+    frozen = g.freeze()
+
+    # mutate original graph after freezing
+    g.set_vertex_attributes("A", color="blue")
+
+    frozen_vertex = frozen.get_vertex("A")
+    live_vertex = g.get_vertex("A")
+
+    assert frozen_vertex.attributes["color"] == "red"
+    assert live_vertex.attributes["color"] == "blue"
+
+
+def test_freeze_is_snapshot_not_live_view_edge_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=1)
+
+    frozen = g.freeze()
+
+    # mutate original graph after freezing
+    g.set_edge_attributes("A", "B", weight=99)
+
+    frozen_edge = frozen.get_edge("A", "B")
+    live_edge = g.get_edge("A", "B")
+
+    assert frozen_edge.attributes["weight"] == 1
+    assert live_edge.attributes["weight"] == 99
+
+
+def test_freeze_not_affected_by_new_vertices():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+
+    frozen = g.freeze()
+
+    g.add_vertex("B")
+
+    assert frozen.contains_vertex("A")
+    assert not frozen.contains_vertex("B")
+
+
+def test_freeze_not_affected_by_new_edges():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_vertex("C")
+
+    g.add_edge("A", "B")
+
+    frozen = g.freeze()
+
+    g.add_edge("B", "C")
+
+    assert frozen.contains_edge("A", "B")
+    assert not frozen.contains_edge("B", "C")
+
+
+def test_freeze_not_affected_by_removals():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_edge("A", "B")
+
+    frozen = g.freeze()
+
+    g.remove_edge("A", "B")
+    g.remove_vertex("B")
+
+    assert frozen.contains_vertex("B")
+    assert frozen.contains_edge("A", "B")
+
+
+def test_frozen_vertices_iterator():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    frozen = g.freeze()
+
+    ids = {v.id for v in frozen.vertices()}
+
+    assert ids == {"A", "B"}
+
+
+def test_frozen_edges_iterator():
+    g = WeightedDigraph()
+
+    for v in ["A", "B", "C"]:
+        g.add_vertex(v)
+
+    g.add_edge("A", "B")
+    g.add_edge("B", "C")
+
+    frozen = g.freeze()
+
+    edges = {
+        (e.start.id, e.end.id)
+        for e in frozen.edges()
+    }
+
+    assert edges == {
+        ("A", "B"),
+        ("B", "C"),
+    }
+
+
+def test_frozen_out_degree():
+    g = WeightedDigraph()
+
+    for v in ["A", "B", "C"]:
+        g.add_vertex(v)
+
+    g.add_edge("A", "B")
+    g.add_edge("A", "C")
+
+    frozen = g.freeze()
+
+    assert frozen.out_degree("A") == 2
+    assert frozen.out_degree("B") == 0
+
+
+def test_frozen_in_degree():
+    g = WeightedDigraph()
+
+    for v in ["A", "B", "C"]:
+        g.add_vertex(v)
+
+    g.add_edge("A", "C")
+    g.add_edge("B", "C")
+
+    frozen = g.freeze()
+
+    assert frozen.in_degree("C") == 2
+    assert frozen.in_degree("A") == 0
+
+
+def test_frozen_edge_objects_shared_between_in_and_out_maps():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=5)
+
+    frozen = g.freeze()
+
+    edge1 = frozen._out_edges["A"]["B"]
+    edge2 = frozen._in_edges["B"]["A"]
+
+    # same exact Edge object
+    assert edge1 is edge2
+
+
+def test_frozen_vertex_objects_are_reused_by_edges():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B")
+
+    frozen = g.freeze()
+
+    edge = frozen.get_edge("A", "B")
+
+    assert edge.start is frozen.get_vertex("A")
+    assert edge.end is frozen.get_vertex("B")
+
+
+# =========================================================
 # main
 # =========================================================
 
-if __name__ == "__main__":
+def run_all_tests():
+    # construction
     test_empty_graph()
     test_default_attributes()
 
+    # vertex operations
     test_add_vertex()
     test_add_existing_vertex_raises()
     test_add_existing_vertex_allowed()
@@ -573,6 +849,7 @@ if __name__ == "__main__":
     test_set_vertex_attributes()
     test_set_missing_vertex_attributes_raises()
 
+    # edge operations
     test_add_edge()
     test_add_edge_requires_vertices()
     test_add_edge_auto_creates_vertices()
@@ -584,19 +861,51 @@ if __name__ == "__main__":
     test_remove_missing_edge_raises()
     test_remove_missing_edge_allowed()
 
+    # graph consistency
     test_removing_vertex_removes_incident_edges()
     test_out_degree()
     test_in_degree()
 
+    # iterators
     test_vertices_iterator()
     test_edges_iterator()
     test_out_edges_iterator()
     test_in_edges_iterator()
 
+    # immutability
     test_vertex_attributes_are_immutable()
     test_edge_attributes_are_immutable()
 
+    # reverse
+    test_reverse_non_inplace_structure()
+    test_reverse_creates_new_graph_object()
+    test_reverse_inplace_mutates_graph()
+    test_reverse_preserves_vertices()
+    test_reverse_degree_swap_property()
+
+    # from_dict
     test_from_dict()
     test_from_dict_supports_isolated_vertices()
 
+    # freeze / frozen graph
+    test_freeze_returns_frozen_graph()
+    test_freeze_preserves_vertex_attributes()
+    test_freeze_preserves_edge_attributes()
+    test_freeze_vertex_attributes_are_immutable()
+    test_freeze_edge_attributes_are_immutable()
+    test_freeze_is_snapshot_not_live_view_vertex_attributes()
+    test_freeze_is_snapshot_not_live_view_edge_attributes()
+    test_freeze_not_affected_by_new_vertices()
+    test_freeze_not_affected_by_new_edges()
+    test_freeze_not_affected_by_removals()
+    test_frozen_vertices_iterator()
+    test_frozen_edges_iterator()
+    test_frozen_out_degree()
+    test_frozen_in_degree()
+    test_frozen_edge_objects_shared_between_in_and_out_maps()
+    test_frozen_vertex_objects_are_reused_by_edges()
+
+
+if __name__ == "__main__":
+    run_all_tests()
     print("All tests passed.")
