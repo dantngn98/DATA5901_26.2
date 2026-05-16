@@ -177,18 +177,23 @@ def test_add_existing_edge_raises():
         g.add_edge("A", "B")
 
 
-def test_add_existing_edge_overwrites():
-    g = WeightedDigraph()
+def test_add_existing_edge_updates():
+    g = WeightedDigraph(
+        default_edge_attributes={
+            "weight": 1,
+            "capacity": 10,
+        }
+    )
 
     g.add_vertex("A")
     g.add_vertex("B")
 
-    g.add_edge("A", "B", weight=1)
+    g.add_edge("A", "B", cost=5)
 
     added = g.add_edge(
         "A",
         "B",
-        allow_overwrite=True,
+        allow_update=True,
         cost=99,
     )
 
@@ -196,8 +201,60 @@ def test_add_existing_edge_overwrites():
 
     edge = g.get_edge("A", "B")
 
-    # overwrite replaces attribute dict entirely
-    assert dict(edge.attributes) == {"cost": 99}
+    # existing attributes preserved unless explicitly updated
+    assert dict(edge.attributes) == {
+        "weight": 1,
+        "capacity": 10,
+        "cost": 99,
+    }
+
+
+def test_add_edge_update_preserves_default_attributes():
+    g = WeightedDigraph(
+        default_edge_attributes={
+            "weight": 1,
+            "status": "active",
+        }
+    )
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B")
+
+    g.add_edge(
+        "A",
+        "B",
+        allow_update=True,
+        cost=5,
+    )
+
+    edge = g.get_edge("A", "B")
+
+    assert edge.attributes["weight"] == 1
+    assert edge.attributes["status"] == "active"
+    assert edge.attributes["cost"] == 5
+
+
+def test_add_edge_update_modifies_existing_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=1, cost=5)
+
+    g.add_edge(
+        "A",
+        "B",
+        allow_update=True,
+        weight=99,
+    )
+
+    edge = g.get_edge("A", "B")
+
+    assert edge.attributes["weight"] == 99
+    assert edge.attributes["cost"] == 5
 
 
 def test_set_edge_attributes():
@@ -424,6 +481,92 @@ def test_edge_attributes_are_immutable():
     with pytest.raises(TypeError):
         edge.attributes["weight"] = 2
 
+
+# =========================================================
+# copy
+# =========================================================
+
+def test_copy_creates_distinct_graph():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+    g.add_edge("A", "B", weight=5)
+
+    c = g.copy()
+
+    assert c is not g
+    assert isinstance(c, WeightedDigraph)
+
+    assert c.contains_vertex("A")
+    assert c.contains_edge("A", "B")
+
+
+def test_copy_preserves_attributes():
+    g = WeightedDigraph(
+        default_vertex_attributes={"color": "red"},
+        default_edge_attributes={"weight": 1},
+    )
+
+    g.add_vertex("A", size=10)
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", cost=5)
+
+    c = g.copy()
+
+    v = c.get_vertex("A")
+    e = c.get_edge("A", "B")
+
+    assert v.attributes["color"] == "red"
+    assert v.attributes["size"] == 10
+
+    assert e.attributes["weight"] == 1
+    assert e.attributes["cost"] == 5
+
+
+def test_copy_is_independent_vertex_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A", color="red")
+
+    c = g.copy()
+
+    g.set_vertex_attributes("A", color="blue")
+
+    assert c.get_vertex("A").attributes["color"] == "red"
+    assert g.get_vertex("A").attributes["color"] == "blue"
+
+
+def test_copy_is_independent_edge_attributes():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    g.add_edge("A", "B", weight=1)
+
+    c = g.copy()
+
+    g.set_edge_attributes("A", "B", weight=99)
+
+    assert c.get_edge("A", "B").attributes["weight"] == 1
+    assert g.get_edge("A", "B").attributes["weight"] == 99
+
+
+def test_copy_is_independent_structure():
+    g = WeightedDigraph()
+
+    g.add_vertex("A")
+    g.add_vertex("B")
+
+    c = g.copy()
+
+    g.add_vertex("C")
+    g.add_edge("A", "B")
+
+    assert not c.contains_vertex("C")
+    assert not c.contains_edge("A", "B")
 
 # =========================================================
 # reverse
@@ -854,11 +997,14 @@ def run_all_tests():
     test_add_edge_requires_vertices()
     test_add_edge_auto_creates_vertices()
     test_add_existing_edge_raises()
-    test_add_existing_edge_overwrites()
+    test_add_existing_edge_updates()
+    test_add_edge_update_preserves_default_attributes()
+    test_add_edge_update_modifies_existing_attributes()
     test_set_edge_attributes()
     test_set_missing_edge_attributes_raises()
     test_remove_edge()
     test_remove_missing_edge_raises()
+    test_remove_edge_missing_vertices_raises()
     test_remove_missing_edge_allowed()
 
     # graph consistency
@@ -875,6 +1021,13 @@ def run_all_tests():
     # immutability
     test_vertex_attributes_are_immutable()
     test_edge_attributes_are_immutable()
+
+    # copy
+    test_copy_creates_distinct_graph()
+    test_copy_preserves_attributes()
+    test_copy_is_independent_vertex_attributes()
+    test_copy_is_independent_edge_attributes()
+    test_copy_is_independent_structure()
 
     # reverse
     test_reverse_non_inplace_structure()
