@@ -368,6 +368,8 @@ def _load_reg_from_s3(bucket: str, key: str) -> XGBRegressor:
 })
 class TrainRegressor(PipelineStep):
     """
+    Define the regression model for predicting recovery rates, either by loading a pre-trained model from S3 or 
+    by training a new XGBoost regressor on the training data output by the preprocessing step.
     Operates on non-zero recovery rows only. Computes site - GL baseline features
     from training data, persists them on the model object as `site_gl_baseline_` and
     `baseline_priors_`, saves to S3, and

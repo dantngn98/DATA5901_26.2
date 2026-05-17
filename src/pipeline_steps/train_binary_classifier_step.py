@@ -393,8 +393,10 @@ def _load_clf_from_s3(bucket: str, key: str) -> XGBClassifier:
 })
 class TrainBinaryClassifier(PipelineStep):
     """
-    Reads the preprocessed Polars DataFrame from context,
-    trains a binary classifier predicting P(prob_recovered > 0), saves the model
+    Define the binary classification model, either by loading a pre-trained model from S3 or 
+    by training a new XGBoost classifier on the training data output by the preprocessing step.
+    
+    Trains a binary classifier predicting P(prob_recovered > 0), saves the model
     to S3, and stores it in context under ContextKeys.CLF_MODEL.
     """
 

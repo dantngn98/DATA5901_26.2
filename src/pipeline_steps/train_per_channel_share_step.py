@@ -83,7 +83,6 @@ _TEMPORAL_COMPOSITION_COLS: list[str] = (
         f"share_{c}_lag_{w}w"
         for c in ["RETAIL", "FBA", "hazmat", "food", "non_food", "pet_food"]
         for w in [1, 4, 12, 13, 52]
-        if not (c == "FBA" and w == 1)  # share_FBA_lag_1w is missing upstream
     ]
     + [
         f"share_{c}_rolling_{w}w"
