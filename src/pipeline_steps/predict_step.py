@@ -295,7 +295,7 @@ class Predict(PipelineStep):
     Loads preprocessed data + all three model types (from context or S3),
     applies optional row filters (site / GL / year / week), runs Stage 1
     (classifier → p_nonzero), Stage 2 (regressor → e_rate), Stage 3
-    (per-channel share regressors → 9 absolute channel rates), and optionally
+    (per-channel share regressors → 4 absolute channel rates), and optionally
     SHAP decomposition.
 
     Output is a Polars DataFrame stored in ContextKeys.PREDICTIONS with columns:
