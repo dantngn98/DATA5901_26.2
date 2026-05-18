@@ -137,5 +137,5 @@ class ContextKeys:
     DF_RECOVERY_PREPROCESSED = "df_recovery_preprocessed"
     CLF_MODEL = "clf_model"         # trained XGBClassifier (Stage 1)
     REG_MODEL = "reg_model"         # trained XGBRegressor (Stage 2)
-    SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 9 per-channel share regressors
+    SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 4 per-channel share regressors
     PREDICTIONS = "predictions"     # output Polars DataFrame from Predict step
