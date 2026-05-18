@@ -390,48 +390,52 @@ class Predict(PipelineStep):
             shap_deviation_contribution[idx] = deviation_sample
 
         # 9. Assemble output DataFrame
+        # Column order: identifiers → (real → predicted → abs_err) per prediction group → diagnostics
         has_gt = "prob_recovered" in df.columns
 
-        out = df.select(["hashed_fc", "gl_product_group", "year", "week"]).with_columns([
-            pl.Series("p_nonzero", p_nonzero),
-            pl.Series("e_rate", e_rate),
-            pl.Series("combined_rate", combined_rate),
-        ])
+        out = df.select(["hashed_fc", "gl_product_group", "year", "week"])
 
-        if self.predict_channels:
-            for channel in RECOVERY_CHANNELS:
-                out = out.with_columns(pl.Series(f"pred_{channel}", channel_rates[channel]))
-
-        out = out.with_columns([
-            pl.Series("shap_baseline_rate", shap_baseline_rate),
-            pl.Series("shap_deviation_contribution", shap_deviation_contribution),
-        ])
-
-        # Buckets: rate_bucket uses ground truth when available, else combined_rate
-        rate_vals = df["prob_recovered"].to_numpy() if has_gt else combined_rate
-        out = out.with_columns([
-            pl.Series("rate_bucket", _rate_bucket(rate_vals)),
-            pl.Series("volume_bucket", _volume_bucket(df["units_total"].to_numpy())),
-        ])
-
-        # Ground truth pass-through and absolute errors
+        # Overall recovery rate group
         if has_gt:
             y_true = df["prob_recovered"].to_numpy()
-            out = out.with_columns([
-                pl.Series("prob_recovered", y_true),
-                pl.Series("abs_err", np.abs(combined_rate - y_true)),
-            ])
-            if self.predict_channels:
-                for channel in RECOVERY_CHANNELS:
-                    if channel in df.columns:
-                        y_channel = df[channel].to_numpy()
-                        out = out.with_columns([
-                            pl.Series(channel, y_channel),
-                            pl.Series(
-                                f"abs_err_{channel}",
-                                np.abs(channel_rates[channel] - y_channel),
-                            ),
-                        ])
+            out = out.with_columns(pl.Series("prob_recovered", y_true))
+
+        out = out.with_columns([
+            pl.Series("p_nonzero",      np.round(p_nonzero,      6)),
+            pl.Series("e_rate",         np.round(e_rate,         6)),
+            pl.Series("combined_rate",  np.round(combined_rate,  6)),
+        ])
+
+        if has_gt:
+            out = out.with_columns(
+                pl.Series("abs_err", np.round(np.abs(combined_rate - y_true), 6))
+            )
+
+        # Per-channel group: real → predicted → abs_err
+        if self.predict_channels:
+            for channel in RECOVERY_CHANNELS:
+                pred_col = np.round(channel_rates[channel], 6)
+                if has_gt and channel in df.columns:
+                    y_channel = df[channel].to_numpy()
+                    out = out.with_columns([
+                        pl.Series(channel,                   y_channel),
+                        pl.Series(f"pred_{channel}",         pred_col),
+                        pl.Series(f"abs_err_{channel}", np.round(np.abs(channel_rates[channel] - y_channel), 6)),
+                    ])
+                else:
+                    out = out.with_columns(pl.Series(f"pred_{channel}", pred_col))
+
+        # Diagnostics
+        out = out.with_columns([
+            pl.Series("shap_baseline_rate",         np.round(shap_baseline_rate,         6)),
+            pl.Series("shap_deviation_contribution", np.round(shap_deviation_contribution, 6)),
+        ])
+
+        rate_vals = df["prob_recovered"].to_numpy() if has_gt else combined_rate
+        out = out.with_columns([
+            pl.Series("rate_bucket",   _rate_bucket(rate_vals)),
+            pl.Series("volume_bucket", _volume_bucket(df["units_total"].to_numpy())),
+        ])
 
         context[ContextKeys.PREDICTIONS] = out
         context.lock(ContextKeys.PREDICTIONS)
