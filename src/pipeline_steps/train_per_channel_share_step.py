@@ -443,12 +443,12 @@ def _train_final_model(
         model.fit(X_train, y_train_lg, verbose=False)
 
     pred = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
-    metrics = {
-        "mae":  float(mean_absolute_error(y_test, pred)),
-        "rmse": float(math.sqrt(mean_squared_error(y_test, pred))),
-        "r2":   float(r2_score(y_test, pred)),
-    }
-    return model, metrics
+    # metrics = {
+    #     "mae":  float(mean_absolute_error(y_test, pred)),
+    #     "rmse": float(math.sqrt(mean_squared_error(y_test, pred))),
+    #     "r2":   float(r2_score(y_test, pred)),
+    # }
+    return model
 
 
 def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
@@ -577,20 +577,20 @@ class TrainPerChannelShareRegressors(PipelineStep):
                 else:
                     best_params = _DEFAULT_CHANNEL_PARAMS[channel]
 
-                model, metrics = _train_final_model(
+                model = _train_final_model(
                     X_train, X_test, y_train, y_test, best_params,
                 )
-                logger.info(
-                    "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
-                    channel, model.best_iteration, metrics["mae"], metrics["r2"],
-                )
+                # logger.info(
+                #     "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
+                #     channel, model.best_iteration, metrics["mae"], metrics["r2"],
+                # )
 
                 # Persist baseline + metadata on the model so a single joblib artifact
                 # is sufficient for downstream inference.
                 model.site_gl_baseline_ = site_gl_baseline
                 model.aug_features_ = aug_features
                 model.channel_ = channel
-                model.metrics_ = metrics
+                # model.metrics_ = metrics
 
                 _save_model_to_s3(model, S3_BUCKET, f"{save_prefix}/{channel}_share.joblib")
 
