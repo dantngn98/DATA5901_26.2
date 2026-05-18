@@ -145,7 +145,9 @@ def _render_performers_section(df: pd.DataFrame, top_n: int) -> str:
     site_tbl = _top_n_by_rate(df, "hashed_fc", top_n)
     html = [
         "<section>",
-        f"<h2>Top {top_n} Recovery Performers</h2>",
+        f"<h2>Highest-Risk Groups (Elevated Recovery Rate)</h2>",
+        "<p>A higher recovery rate indicates more product being returned, donated, or disposed of "
+        "rather than sold. The groups below warrant the most attention.</p>",
         f"<h3>GL Product Groups</h3>",
         _df_to_html_table(gl_tbl),
         f"<h3>Sites</h3>",
@@ -159,28 +161,43 @@ def _render_performers_section(df: pd.DataFrame, top_n: int) -> str:
 # Section 3 — Weekly trend charts
 # ============================================================
 
-def _chart_weekly_trend(df: pd.DataFrame) -> str:
-    weekly = df.groupby("week").agg(
-        mean_pred=("combined_rate", "mean"),
-    ).reset_index()
+def _chart_weekly_single(
+    df: pd.DataFrame,
+    group_col: str,
+    group_val: str,
+) -> str:
+    subset = df[df[group_col] == group_val]
+    weekly = subset.groupby("week")["combined_rate"].mean().reset_index()
 
-    has_gt = "prob_recovered" in df.columns
-    if has_gt:
-        weekly_gt = df.groupby("week")["prob_recovered"].mean().reset_index()
-        weekly = weekly.merge(weekly_gt, on="week")
-
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(weekly["week"], weekly["mean_pred"], marker="o", label="Predicted combined rate", color="#1f77b4")
-    if has_gt:
-        ax.plot(weekly["week"], weekly["prob_recovered"], marker="o", linestyle="--",
-                label="Actual recovery rate", color="#ff7f0e")
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Recovery rate")
-    ax.set_title("Overall Recovery Rate by Week")
-    ax.legend()
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.plot(weekly["week"], weekly["combined_rate"], marker="o", color="#1f77b4", label="Predicted")
+    if "prob_recovered" in subset.columns:
+        gt = subset.groupby("week")["prob_recovered"].mean().reset_index()
+        ax.plot(gt["week"], gt["prob_recovered"], marker="o", linestyle="--",
+                color="#ff7f0e", label="Actual")
+        ax.legend(fontsize=7)
+    ax.set_xlabel("Week", fontsize=8)
+    ax.set_ylabel("Recovery rate", fontsize=8)
+    ax.set_title(group_val, fontsize=9)
+    ax.tick_params(labelsize=7)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return _fig_to_b64(fig)
+
+
+def _charts_weekly_individual(
+    df: pd.DataFrame,
+    group_col: str,
+    top_n: int,
+) -> list[tuple[str, str]]:
+    top_vals = (
+        df.groupby(group_col)["combined_rate"]
+        .mean()
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index.tolist()
+    )
+    return [(val, _chart_weekly_single(df, group_col, val)) for val in top_vals]
 
 
 def _chart_weekly_channels(df: pd.DataFrame) -> str | None:
@@ -204,13 +221,29 @@ def _chart_weekly_channels(df: pd.DataFrame) -> str | None:
     return _fig_to_b64(fig)
 
 
-def _render_trend_section(df: pd.DataFrame) -> str:
-    b64_overall   = _chart_weekly_trend(df)
-    b64_channels  = _chart_weekly_channels(df)
+def _render_individual_charts(charts: list[tuple[str, str]]) -> str:
+    items = "".join(
+        f'<figure style="margin:0;">'
+        f'<img src="data:image/png;base64,{b64}" style="width:100%;border:1px solid #ddd;border-radius:4px;"/>'
+        f'<figcaption style="font-size:.8rem;text-align:center;color:#555;">{label}</figcaption>'
+        f'</figure>'
+        for label, b64 in charts
+    )
+    return f'<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;margin-bottom:1.5rem;">{items}</div>'
+
+
+def _render_trend_section(df: pd.DataFrame, top_n: int) -> str:
+    gl_charts   = _charts_weekly_individual(df, "gl_product_group", top_n)
+    site_charts = _charts_weekly_individual(df, "hashed_fc", top_n)
+    b64_channels = _chart_weekly_channels(df)
+
     html = [
         "<section>",
         "<h2>Recovery Rate Trend over Week</h2>",
-        _img_tag(b64_overall),
+        f"<h3>Top {top_n} GL Product Groups</h3>",
+        _render_individual_charts(gl_charts),
+        f"<h3>Top {top_n} Sites</h3>",
+        _render_individual_charts(site_charts),
     ]
     if b64_channels:
         html += ["<h3>Per-Channel Breakdown</h3>", _img_tag(b64_channels)]
@@ -250,7 +283,7 @@ def _chart_shap_attribution(df: pd.DataFrame, top_n: int = 5) -> str:
     ax.set_xticks(x)
     ax.set_xticklabels(site_shap["hashed_fc"], rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("Recovery rate (SHAP decomposition)")
-    ax.set_title(f"Top {top_n} Sites — Baseline vs Deviation Contribution")
+    ax.set_title(f"Top {top_n} Highest-Risk Sites — SHAP Baseline vs Deviation")
     ax.legend()
     ax.grid(True, alpha=0.3, axis="y")
     fig.tight_layout()
@@ -277,9 +310,10 @@ def _render_shap_section(df: pd.DataFrame, top_n: int) -> str:
         "<p>The stacked bars show how much of each site's recovery rate comes from its "
         "historical site-GL baseline (blue) versus signals from the current week (orange).</p>",
         _img_tag(b64),
-        f"<p><strong>Callout:</strong> Site <code>{best_site}</code> has the highest "
-        f"current-week deviation contribution (<strong>{best_dev:.4f}</strong>), meaning "
-        "its recovery this period is driven primarily by recent activity rather than historical norms.</p>",
+        f"<p><strong>Callout:</strong> Site <code>{best_site}</code> has the largest "
+        f"current-week deviation above its historical baseline (<strong>+{best_dev:.4f}</strong>), "
+        "indicating it is at <strong>heightened risk</strong> this period beyond what its "
+        "site-GL history would predict.</p>",
         "</section>",
     ]
     return "\n".join(html)
@@ -312,7 +346,7 @@ def _build_report(df: pd.DataFrame, top_n: int) -> str:
     sections = [
         _render_mae_section(mae_summary),
         _render_performers_section(df, top_n),
-        _render_trend_section(df),
+        _render_trend_section(df, top_n),
         _render_shap_section(df, top_n),
     ]
 
@@ -357,9 +391,9 @@ class Report(PipelineStep):
 
     Sections:
       1. Model performance summary (overall MAE, MAE by rate/volume bucket)
-      2. Top-N GL groups and sites by mean predicted recovery rate
-      3. Recovery-rate trend charts over week (overall + per-channel)
-      4. SHAP baseline-vs-deviation attribution for top sites (skipped when SHAP not run)
+      2. Highest-risk GL groups and sites by mean predicted recovery rate (high rate = bad outcome)
+      3. Individual recovery-rate trend charts per GL group and per site (top_n each) + per-channel
+      4. SHAP baseline-vs-deviation attribution for highest-risk sites (skipped when SHAP not run)
 
     The HTML string is stored in ContextKeys.REPORT and optionally uploaded to S3.
     """
