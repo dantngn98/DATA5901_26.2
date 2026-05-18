@@ -60,6 +60,7 @@ CLF_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_classification_model.joblib"
 REG_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_regression_model.joblib"
 SHARE_MODELS_S3_PREFIX = f"{MODEL_DIR}/recovery_channel_share_softmax"  # per-channel share regressors live under this prefix
 PREDICTIONS_S3_KEY = f"{MODEL_DIR}/predictions.parquet"
+REPORT_S3_KEY = "out/report.html"
 
 
 # ============================================================
@@ -139,3 +140,4 @@ class ContextKeys:
     REG_MODEL = "reg_model"         # trained XGBRegressor (Stage 2)
     SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 4 per-channel share regressors
     PREDICTIONS = "predictions"     # output Polars DataFrame from Predict step
+    REPORT = "report"               # HTML string produced by Report step
