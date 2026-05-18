@@ -44,7 +44,7 @@ s3://msds-26.2-data/
 S3_BUCKET_URI = "s3://msds-26.2-data"
 YEARLY_RECOVERY_DATA_CSV_FPS = [
     str(f"{S3_BUCKET_URI}/data/unprocessed/sanitized_{year}.csv")
-    for year in range(2022, 2025)
+    for year in range(2022, 2026)
 ]
 # MODEL_DIR = S3_BUCKET/"model"
 # CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"

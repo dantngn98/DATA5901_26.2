@@ -293,7 +293,7 @@ def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
 def _recovery_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
         _safe_division("units_sales", "units_recovered", "share_sales"),                                        # |Sales|/|~Sales|
-        _safe_division("units_return_to_vendor", "units_recovered", "_share_return_to_vendor"),      # P(Return to Vendor | ~Sale)
+        _safe_division("units_return_to_vendor", "units_recovered", "share_return_to_vendor"),      # P(Return to Vendor | ~Sale)
         _safe_division("units_warehouse_deals_and_gr", "units_recovered", "share_warehouse_deals_and_gr"),  # P(Warehouse Deals and G&R | ~Sale)
         _safe_division("units_donations", "units_recovered", "share_donations"),                   # P(Donations | ~Sale) — includes bintool_donations
         _safe_division("units_liquidations", "units_recovered", "share_liquidations"),             # P(Liquidations | ~Sale)
