@@ -40,17 +40,17 @@ s3://msds-26.2-data/
 │       ├── prob_bintool_remove_liquidate_reg.joblib
 │       └── ...
 """
-
-S3_BUCKET = S3Path(bucket="msds-26.2-data")
+# === S3 data storage ===
+S3_BUCKET_URI = "s3://msds-26.2-data"
 YEARLY_RECOVERY_DATA_CSV_FPS = [
-    f"{S3_BUCKET}/sanitized_{year}.csv"
-    for year in range(2022, 2026)
+    str(f"{S3_BUCKET_URI}/data/unprocessed/sanitized_{year}.csv")
+    for year in range(2022, 2025)
 ]
-MODEL_DIR = S3_BUCKET/"model"
-CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"
-REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"
-SHARE_MODELS_DIR = MODEL_DIR/"recovery_channel_regression"
-PREDICTIONS_PARQUET = MODEL_DIR/"predictions.parquet"
+# MODEL_DIR = S3_BUCKET/"model"
+# CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"
+# REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"
+# SHARE_MODELS_DIR = MODEL_DIR/"recovery_channel_regression"
+PREDICTIONS_PARQUET = f"{S3_BUCKET_URI}/out/predictions.parquet"
 
 
 # === S3 model storage ===

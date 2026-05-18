@@ -23,7 +23,7 @@ class Load(PipelineStep):
     """
 
     def __init__(self, recovery_data_source: str | Iterable[str]):
-        self.source = recovery_data_source
+        self.recovery_data_source = recovery_data_source
 
     def __call__(self, context: Context) -> Context:
         logger.info(f"loading data from {self.recovery_data_source}")

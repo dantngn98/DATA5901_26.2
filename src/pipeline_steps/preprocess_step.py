@@ -91,10 +91,11 @@ class Preprocess(PipelineStep):
                 .pipe(_unit_distribution_features)      # X% of units are Y
                 .pipe(_recovery_distribution_features)  # X% of recovered units are recovery_type Y
                 .pipe(_iso_week)
-                .pipe(_site_week_features)
+                .pipe(
+                    _site_week_features,
+                    groupby=[RecoverySchema.HASHED_FC, "week_date"])
                 .pipe(                                  # e.g., X% of site-week units are GL Y
                     _gl_share_features,
-                    groupby=[RecoverySchema.HASHED_FC, "week_date"]
                 )
                 .pipe(_other_non_temporal_features)
                 .pipe(_round_decimal_columns, decimals=6)
@@ -165,7 +166,6 @@ def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
         RecoverySchema.PRODUCT_TYPE,
         RecoverySchema.MACRO_CATEGORY,
         RecoverySchema.ITEM_DISPOSITION_CODE,
-        RecoverySchema.REASON_CODE,
         RecoverySchema.APPLICATION_NAME,
         RecoverySchema.IS_STRANDED,
         RecoverySchema.REASON_CODE,
@@ -202,7 +202,7 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
                 pl.first(field)
                 for field in (
                     RecoverySchema.COUNTRY, RecoverySchema.COUNTRY_STATE, RecoverySchema.ZIP_CODE,
-                    RecursionError.SITE_TYPE, RecoverySchema.SITE_CATEGORY
+                    RecoverySchema.SITE_TYPE, RecoverySchema.SITE_CATEGORY
                 )
             ],
 
@@ -225,7 +225,7 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
                 sum_col="units",
                 alias="units_recovered",
                 comparator=ne
-            ).values(),
+            ),
             *_conditional_sums(  # units_sales, units_return_to_vendor, ...
                 filter_col=RecoverySchema.RECOVERY_TYPE,
                 filter_value_to_str=RECOVERY_TYPES,
@@ -283,7 +283,7 @@ def _iso_week(df: pl.DataFrame) -> pl.DataFrame:
         pl.date(pl.col(RecoverySchema.YEAR), 1, 4)
         .dt.truncate("1w")
         .dt.offset_by(
-            f"{(pl.col(RecoverySchema.WEEK).cast(pl.Int32) - 1).cast(pl.Utf8)}w"
+            (pl.col(RecoverySchema.WEEK).cast(pl.Int32) - 1).cast(pl.Utf8) + "w"
         )
         .alias("week_date")
     )
@@ -457,7 +457,7 @@ def _conditional_sums(
             sum_col,
             alias = f"{alias_prefix}_{filter_value_string}"
         )
-        for filter_value, filter_value_string in filter_value_to_str
+        for filter_value, filter_value_string in filter_value_to_str.items()
     }
 
 def _safe_division(numerator_col: str, denominator_col: str, alias: str) -> pl.Expr:

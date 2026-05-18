@@ -418,7 +418,7 @@ class TrainBinaryClassifier(PipelineStep):
 
     def __call__(self, context: Context) -> Context:
         if self.read_from_key is not None:
-            model = _load_clf_from_s3(model, S3_BUCKET, self.read_from_key)
+            model = _load_clf_from_s3(S3_BUCKET, self.read_from_key)
         else:
             df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
