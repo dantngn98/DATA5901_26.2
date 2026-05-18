@@ -428,7 +428,10 @@ def _train_final_model(
         eval_metric=_prob_mae,
         **best_params,
     )
-    model.fit(X_train, y_train_lg, eval_set=[(X_test, y_test_lg)], verbose=False)
+    if y_test_lg.size > 0:
+        model.fit(X_train, y_train_lg, eval_set=[(X_test, y_test_lg)], verbose=False)
+    else:
+        model.fit(X_train, y_train_lg, verbose=False)
 
     pred = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
     metrics = {
