@@ -440,8 +440,8 @@ def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
 
 def _register_custom_metrics() -> None:
     import __main__
-    if not hasattr(__main__, "prob_mae"):
-        __main__.prob_mae = _prob_mae
+    if not hasattr(__main__, "_prob_mae"):
+        __main__._prob_mae = _prob_mae
 
 def _load_model_from_s3(bucket: str, key: str) -> XGBRegressor:
     _register_custom_metrics()
