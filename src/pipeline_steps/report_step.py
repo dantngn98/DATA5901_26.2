@@ -25,6 +25,7 @@ _CHANNEL_LABELS: dict[str, str] = {
     "prob_liquidations":            "Liquidations",
     "prob_return_to_vendor":        "Return to Vendor",
     "prob_warehouse_deals_and_gr":  "Warehouse Deals / GR",
+    "prob_disposal":                "Disposal",
 }
 
 _RATE_BUCKET_ORDER   = ["zero", "0-10%", "10-30%", "30-60%", ">60%"]

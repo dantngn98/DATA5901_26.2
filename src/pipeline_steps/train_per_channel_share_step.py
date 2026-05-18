@@ -29,10 +29,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 # Per-channel target column names (each is a share of total units in the parquet).
-# Consolidated from 9 raw sub-channels into 4 reporting channels:
+# Consolidated from raw sub-channels (see preprocess_step._CHANNEL_CONSOLIDATION):
 #   donations          = donations + bintool_donations
-#   liquidations       = liquidations + remove_liquidate + bintool_remove_liquidate
-#   return_to_vendor   = return_to_vendor + remove_return
+#   disposal           = remove_return + bintool_remove_liquidate + remove_liquidate
+#   liquidations       = unchanged
+#   return_to_vendor   = unchanged
 #   warehouse_deals_and_gr = unchanged
 #   bintool_theft      = dropped
 RECOVERY_CHANNELS: list[str] = [
@@ -40,6 +41,7 @@ RECOVERY_CHANNELS: list[str] = [
     "prob_liquidations",
     "prob_return_to_vendor",
     "prob_warehouse_deals_and_gr",
+    "prob_disposal",
 ]
 
 # Short channel names used to construct per-channel temporal feature names.
@@ -48,6 +50,7 @@ _CHANNEL_SHORT_NAMES: list[str] = [
     "liquidations",
     "return_to_vendor",
     "warehouse_deals_and_gr",
+    "disposal",
 ]
 
 _CAT_COLS: list[str] = [
@@ -225,6 +228,16 @@ _DEFAULT_CHANNEL_PARAMS: dict[str, dict] = {
         "gamma": 2.9575883549786286,
         "reg_alpha": 0.0008500602063823264,
         "reg_lambda": 0.105063075386338,
+    },
+    "prob_disposal": {             # element-wise mean of the 4 tuned channels above
+        "max_depth":        8,
+        "learning_rate":    0.10303364894496688,
+        "subsample":        0.7949352732615969,
+        "colsample_bytree": 0.4266733762096135,
+        "min_child_weight": 27,
+        "gamma":            1.9174437521560582,
+        "reg_alpha":        1.8970289690794687,
+        "reg_lambda":       0.047716386888,
     },
 }
 

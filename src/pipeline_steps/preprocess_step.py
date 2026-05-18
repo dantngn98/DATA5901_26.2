@@ -35,11 +35,26 @@ RECOVERY_TYPES = {
             "Liquidations",
             "Bintool Remove Liquidate",
             "Remove Liquidate",
-            "Bintool Theft"
+            #"Bintool Theft",  # dropped — not modelled
             #"C-Returns"  # we drop this type
         )
     },
     "Warehouse Deals and G&R": "warehouse_deals_and_gr"
+}
+
+# Maps consolidated channel name → raw units_* columns that roll up into it.
+# Output column is always units_{name}. When the output name matches a source
+# (donations case) the source is overwritten with the combined sum.
+_CHANNEL_CONSOLIDATION: dict[str, list[str]] = {
+    "disposal": [                        # anything with "remove" in the recovery-type name
+        "units_remove_return",
+        "units_bintool_remove_liquidate",
+        "units_remove_liquidate",
+    ],
+    "donations": [                       # anything with "donations" in the recovery-type name
+        "units_donations",
+        "units_bintool_donations",
+    ],
 }
 
 MACRO_CATEGORIES = {
@@ -88,6 +103,7 @@ class Preprocess(PipelineStep):
                         RecoverySchema.WEEK, RecoverySchema.GL_PRODUCT_GROUP
                     ]
                 )
+                .pipe(_consolidate_channels)            # merge sub-channels per _CHANNEL_CONSOLIDATION
                 .pipe(_unit_distribution_features)      # X% of units are Y
                 .pipe(_recovery_distribution_features)  # X% of recovered units are recovery_type Y
                 .pipe(_iso_week)
@@ -107,7 +123,6 @@ class Preprocess(PipelineStep):
                     rolling_weeks_long = [26, 52],
                     ewma_alphas = [0.5, 0.1] 
                 )
-                # _post_cleaning
             )
 
         # save preprocessed data to output file if provided
@@ -236,6 +251,21 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
         ])
     )
 
+def _consolidate_channels(df: pl.DataFrame) -> pl.DataFrame:
+    """Sum raw sub-channel unit columns into consolidated channel columns."""
+    new_cols = [
+        pl.sum_horizontal([pl.col(c) for c in srcs]).alias(f"units_{name}")
+        for name, srcs in _CHANNEL_CONSOLIDATION.items()
+    ]
+    to_drop = [
+        c
+        for name, srcs in _CHANNEL_CONSOLIDATION.items()
+        for c in srcs
+        if c != f"units_{name}"
+    ]
+    return df.with_columns(new_cols).drop(to_drop)
+
+
 def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
         # macro category
@@ -253,29 +283,21 @@ def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
         # recovered units
         _safe_division("units_sales", "units_total", "prob_sales"),                                        # P(Sales)
         _safe_division("units_recovered", "units_total", "prob_recovered"),                                # P(~Sales) = 1-P(Sales) = SUM of below
-        _safe_division("units_return_to_vendor", "units_total", "prob_return_to_vendor"),                  # P(Return to Vendor)
-        _safe_division("units_warehouse_deals_and_gr", "units_total", "prob_warehouse_deals_and_gr"),      # P(Warehouse Deals and G&R)
-        _safe_division("units_remove_return", "units_total", "prob_remove_return"),                        # P(Remove Return)
-        _safe_division("units_donations", "units_total", "prob_donations"),                                # P(Donations)
-        _safe_division("units_bintool_donations", "units_total", "prob_bintool_donations"),                # P(Bintool Donations)
-        _safe_division("units_liquidations", "units_total", "prob_liquidations"),                          # P(Liquidations)
-        _safe_division("units_bintool_remove_liquidate", "units_total", "prob_bintool_remove_liquidate"),  # P(Bintool Remove Liquidate)
-        _safe_division("units_remove_liquidate", "units_total", "prob_remove_liquidate"),                  # P(Remove Liquidate)
-        _safe_division("units_bintool_theft", "units_total", "prob_bintool_theft")                         # P(Bintool Theft)
+        _safe_division("units_return_to_vendor", "units_total", "prob_return_to_vendor"),       # P(Return to Vendor)
+        _safe_division("units_warehouse_deals_and_gr", "units_total", "prob_warehouse_deals_and_gr"),  # P(Warehouse Deals and G&R)
+        _safe_division("units_donations", "units_total", "prob_donations"),                    # P(Donations) — includes bintool_donations
+        _safe_division("units_liquidations", "units_total", "prob_liquidations"),              # P(Liquidations)
+        _safe_division("units_disposal", "units_total", "prob_disposal"),                      # P(Disposal) — remove_return + bintool_remove_liquidate + remove_liquidate
     ])
 
 def _recovery_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
         _safe_division("units_sales", "units_recovered", "share_sales"),                                        # |Sales|/|~Sales|
-        _safe_division("units_return_to_vendor", "units_recovered", "_share_return_to_vendor"),                 # P(Return to Vendor | ~Sale)
-        _safe_division("units_warehouse_deals_and_gr", "units_recovered", "share_warehouse_deals_and_gr"),      # P(Warehouse Deals and G&R | ~Sale)
-        _safe_division("units_remove_return", "units_recovered", "share_remove_return"),                        # P(Remove Return | ~Sale)
-        _safe_division("units_donations", "units_recovered", "share_donations"),                                # P(Donations | ~Sale)
-        _safe_division("units_bintool_donations", "units_recovered", "share_bintool_donations"),                # P(Bintool Donations | ~Sale)
-        _safe_division("units_liquidations", "units_recovered", "share_liquidations"),                          # P(Liquidations | ~Sale)
-        _safe_division("units_bintool_remove_liquidate", "units_recovered", "share_bintool_remove_liquidate"),  # P(Bintool Remove Liquidate | ~Sale)
-        _safe_division("units_remove_liquidate", "units_recovered", "share_remove_liquidate"),                  # P(Remove Liquidate | ~Sale)
-        _safe_division("units_bintool_theft", "units_recovered", "share_bintool_theft")                         # P(Bintool Theft | ~Sale)
+        _safe_division("units_return_to_vendor", "units_recovered", "_share_return_to_vendor"),      # P(Return to Vendor | ~Sale)
+        _safe_division("units_warehouse_deals_and_gr", "units_recovered", "share_warehouse_deals_and_gr"),  # P(Warehouse Deals and G&R | ~Sale)
+        _safe_division("units_donations", "units_recovered", "share_donations"),                   # P(Donations | ~Sale) — includes bintool_donations
+        _safe_division("units_liquidations", "units_recovered", "share_liquidations"),             # P(Liquidations | ~Sale)
+        _safe_division("units_disposal", "units_recovered", "share_disposal"),                     # P(Disposal | ~Sale) — remove_return + bintool_remove_liquidate + remove_liquidate
     ])
 
 def _iso_week(df: pl.DataFrame) -> pl.DataFrame:
@@ -294,17 +316,13 @@ def _site_week_features(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
         pl.sum("weight_total").over(groupby).alias("site_weight_total_week"),
         pl.sum("units_recovered").over(groupby).alias("site_units_recovered_week"),
 
-        # Recovery type site totals
-        pl.sum("units_remove_return").over(groupby).alias("site_units_remove_return_week"),
-        pl.sum("units_bintool_donations").over(groupby).alias("site_units_bintool_donations_week"),
+        # Recovery type site totals (consolidated channels)
         pl.sum("units_donations").over(groupby).alias("site_units_donations_week"),
+        pl.sum("units_disposal").over(groupby).alias("site_units_disposal_week"),
         pl.sum("units_warehouse_deals_and_gr").over(groupby).alias("site_units_warehouse_deals_and_gr_week"),
         pl.sum("units_liquidations").over(groupby).alias("site_units_liquidations_week"),
         pl.sum("units_sales").over(groupby).alias("site_units_sales_week"),
         pl.sum("units_return_to_vendor").over(groupby).alias("site_units_return_to_vendor_week"),
-        pl.sum("units_bintool_theft").over(groupby).alias("site_units_bintool_theft_week"),
-        pl.sum("units_remove_liquidate").over(groupby).alias("site_units_remove_liquidate_week"),
-        pl.sum("units_bintool_remove_liquidate").over(groupby).alias("site_units_bintool_remove_liquidate_week")
     ])
 
 def _gl_share_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -316,17 +334,13 @@ def _gl_share_features(df: pl.DataFrame) -> pl.DataFrame:
         # Overall recovery probability at site level
         (pl.col("site_units_recovered_week") / pl.col("site_units_total_week")).alias("site_prob_recovered_week"),
 
-        # Per recovery outcome probability at site level
-        (pl.col("site_units_remove_return_week") / pl.col("site_units_total_week")).alias("site_prob_remove_return_week"),
-        (pl.col("site_units_bintool_donations_week") / pl.col("site_units_total_week")).alias("site_prob_bintool_donations_week"),
+        # Per consolidated channel probability at site level
         (pl.col("site_units_donations_week") / pl.col("site_units_total_week")).alias("site_prob_donations_week"),
+        (pl.col("site_units_disposal_week") / pl.col("site_units_total_week")).alias("site_prob_disposal_week"),
         (pl.col("site_units_warehouse_deals_and_gr_week") / pl.col("site_units_total_week")).alias("site_prob_warehouse_deals_and_gr_week"),
         (pl.col("site_units_liquidations_week") / pl.col("site_units_total_week")).alias("site_prob_liquidations_week"),
         (pl.col("site_units_sales_week") / pl.col("site_units_total_week")).alias("site_prob_sales_week"),
         (pl.col("site_units_return_to_vendor_week") / pl.col("site_units_total_week")).alias("site_prob_return_to_vendor_week"),
-        (pl.col("site_units_bintool_theft_week") / pl.col("site_units_total_week")).alias("site_prob_bintool_theft_week"),
-        (pl.col("site_units_remove_liquidate_week") / pl.col("site_units_total_week")).alias("site_prob_remove_liquidate_week"),
-        (pl.col("site_units_bintool_remove_liquidate_week") / pl.col("site_units_total_week")).alias("site_prob_bintool_remove_liquidate_week"),
     ])
 
 def _other_non_temporal_features(df: pl.DataFrame) -> pl.DataFrame:
