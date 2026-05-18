@@ -418,19 +418,28 @@ def _train_final_model(
     y_train_lg = _logit(y_train)
     y_test_lg  = _logit(y_test)
 
-    model = XGBRegressor(
-        objective="reg:squarederror",
-        n_estimators=2000,
-        tree_method="hist",
-        enable_categorical=True,
-        random_state=42,
-        early_stopping_rounds=50,
-        eval_metric=_prob_mae,
-        **best_params,
-    )
+
     if y_test_lg.size > 0:
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=2000,
+            tree_method="hist",
+            enable_categorical=True,
+            random_state=42,
+            early_stopping_rounds=50,
+            eval_metric=_prob_mae,
+            **best_params,
+        )
         model.fit(X_train, y_train_lg, eval_set=[(X_test, y_test_lg)], verbose=False)
     else:
+        model = XGBRegressor(
+            objective="reg:squarederror",
+            n_estimators=2000,
+            tree_method="hist",
+            enable_categorical=True,
+            random_state=42,
+            **best_params,
+        )
         model.fit(X_train, y_train_lg, verbose=False)
 
     pred = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
