@@ -438,13 +438,28 @@ def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
         logger.exception("Failed to save channel-share model to s3://%s/%s", bucket, key)
         raise
 
+def _load_model_from_s3(bucket: str, key: str) -> XGBRegressor:
+    s3_client = boto3.client("s3")
+    try:
+        with tempfile.TemporaryFile() as fp:
+            s3_client.download_fileobj(bucket, key, fp)
+            fp.seek(0)
+            model = joblib.load(fp)
+            if not isinstance(model, XGBRegressor):
+                raise ValueError(f"Object loaded from s3://{bucket}/{key} is not an XGBRegressor")
+            logger.info("Channel-share model loaded from s3://%s/%s", bucket, key)
+            return model
+    except Exception:
+        logger.exception("Failed to load channel-share model from s3://%s/%s", bucket, key)
+        raise
+
 
 # ============================================================
 # Pipeline step
 # ============================================================
 
 @enforce({
-    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from makes it optional
+    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from_key makes it optional
     ContextKeys.SHARE_MODELS: Sequence(Defines(strict=True), Locks(strict=True)),
 })
 class TrainPerChannelShareRegressors(PipelineStep):
@@ -455,9 +470,13 @@ class TrainPerChannelShareRegressors(PipelineStep):
     prob_recovered > 0. When tune=True, a separate Optuna study is run per
     channel; when tune=False, the baked-in _DEFAULT_CHANNEL_PARAMS are used.
 
-    Each model carries `site_gl_baseline_`, `aug_features_`, `channel_`, and
-    `metrics_` so that downstream inference can recover everything from the
-    single artifact. Models are saved to S3 under SHARE_MODELS_S3_PREFIX
+    When read_from_key is provided, all 4 models are loaded from S3 using
+    read_from_key as the prefix (e.g. "model/recovery_channel_share_softmax")
+    and no training occurs.
+
+    Each trained model carries `site_gl_baseline_`, `aug_features_`, `channel_`,
+    and `metrics_` so that downstream inference can recover everything from the
+    single artifact. Trained models are saved to S3 under save_to_prefix
     (one .joblib per channel) and stored in context under
     ContextKeys.SHARE_MODELS as a dict keyed by channel name.
 
@@ -471,73 +490,80 @@ class TrainPerChannelShareRegressors(PipelineStep):
         n_trials: int = 50,
         train_years: list[int] | None = None,
         test_years: list[int] | None = None,
-        read_from: str | None = None,
+        read_from_key: str | None = None,
         save_to_prefix: str | None = None,
     ):
         self.tune = tune
         self.n_trials = n_trials
         self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
         self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
-        self.read_from = read_from
+        self.read_from_key = read_from_key
         self.save_to_prefix = save_to_prefix or SHARE_MODELS_S3_PREFIX
 
     def __call__(self, context: Context) -> Context:
-        if self.read_from is not None:
-            df = load(self.read_from)
+        if self.read_from_key is not None:
+            prefix = self.read_from_key.rstrip("/")
+            share_models: dict[str, XGBRegressor] = {}
+            for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
+                logger.info(
+                    "[%d/%d] Loading pre-trained share model for channel '%s'",
+                    i, len(RECOVERY_CHANNELS), channel,
+                )
+                share_models[channel] = _load_model_from_s3(S3_BUCKET, f"{prefix}/{channel}_share.joblib")
         else:
             df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
-        feature_cols = _resolve_feature_cols(df)
-        logger.info(
-            "Per-channel share regressor: %d / %d base features resolved against frame schema",
-            len(feature_cols), len(_BASE_FEATURE_COLS),
-        )
-
-        share_models: dict[str, XGBRegressor] = {}
-        prefix = self.save_to_prefix.rstrip("/")
-        for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
+            feature_cols = _resolve_feature_cols(df)
             logger.info(
-                "[%d/%d] Training share regressor for channel '%s'",
-                i, len(RECOVERY_CHANNELS), channel,
+                "Per-channel share regressor: %d / %d base features resolved against frame schema",
+                len(feature_cols), len(_BASE_FEATURE_COLS),
             )
 
-            X_train, X_test, y_train, y_test, site_gl_baseline, aug_features = (
-                _build_channel_splits(
-                    df,
-                    target_col=channel,
-                    train_years=self.train_years,
-                    test_years=self.test_years,
-                    feature_cols=feature_cols,
+            share_models = {}
+            save_prefix = self.save_to_prefix.rstrip("/")
+            for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
+                logger.info(
+                    "[%d/%d] Training share regressor for channel '%s'",
+                    i, len(RECOVERY_CHANNELS), channel,
                 )
-            )
 
-            if self.tune:
-                best_params = _tune_with_optuna(
-                    X_train, X_test, y_train, y_test,
-                    n_trials=self.n_trials,
-                    channel=channel,
+                X_train, X_test, y_train, y_test, site_gl_baseline, aug_features = (
+                    _build_channel_splits(
+                        df,
+                        target_col=channel,
+                        train_years=self.train_years,
+                        test_years=self.test_years,
+                        feature_cols=feature_cols,
+                    )
                 )
-            else:
-                best_params = _DEFAULT_CHANNEL_PARAMS[channel]
 
-            model, metrics = _train_final_model(
-                X_train, X_test, y_train, y_test, best_params,
-            )
-            logger.info(
-                "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
-                channel, model.best_iteration, metrics["mae"], metrics["r2"],
-            )
+                if self.tune:
+                    best_params = _tune_with_optuna(
+                        X_train, X_test, y_train, y_test,
+                        n_trials=self.n_trials,
+                        channel=channel,
+                    )
+                else:
+                    best_params = _DEFAULT_CHANNEL_PARAMS[channel]
 
-            # Persist baseline + metadata on the model so a single joblib artifact
-            # is sufficient for downstream inference.
-            model.site_gl_baseline_ = site_gl_baseline
-            model.aug_features_ = aug_features
-            model.channel_ = channel
-            model.metrics_ = metrics
+                model, metrics = _train_final_model(
+                    X_train, X_test, y_train, y_test, best_params,
+                )
+                logger.info(
+                    "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
+                    channel, model.best_iteration, metrics["mae"], metrics["r2"],
+                )
 
-            _save_model_to_s3(model, S3_BUCKET, f"{prefix}/{channel}_share.joblib")
+                # Persist baseline + metadata on the model so a single joblib artifact
+                # is sufficient for downstream inference.
+                model.site_gl_baseline_ = site_gl_baseline
+                model.aug_features_ = aug_features
+                model.channel_ = channel
+                model.metrics_ = metrics
 
-            share_models[channel] = model
+                _save_model_to_s3(model, S3_BUCKET, f"{save_prefix}/{channel}_share.joblib")
+
+                share_models[channel] = model
 
         context[ContextKeys.SHARE_MODELS] = share_models
         context.lock(ContextKeys.SHARE_MODELS)

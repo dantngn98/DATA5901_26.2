@@ -424,12 +424,14 @@ class Predict(PipelineStep):
             if self.predict_channels:
                 for channel in RECOVERY_CHANNELS:
                     if channel in df.columns:
-                        out = out.with_columns(
+                        y_channel = df[channel].to_numpy()
+                        out = out.with_columns([
+                            pl.Series(channel, y_channel),
                             pl.Series(
                                 f"abs_err_{channel}",
-                                np.abs(channel_rates[channel] - df[channel].to_numpy()),
-                            )
-                        )
+                                np.abs(channel_rates[channel] - y_channel),
+                            ),
+                        ])
 
         context[ContextKeys.PREDICTIONS] = out
         context.lock(ContextKeys.PREDICTIONS)
