@@ -27,8 +27,12 @@ _CHANNEL_LABELS: dict[str, str] = {
     "prob_warehouse_deals_and_gr":  "Warehouse Deals / GR",
 }
 
-_RATE_BUCKET_ORDER = ["zero", "0-10%", "10-30%", "30-60%", ">60%"]
+_RATE_BUCKET_ORDER   = ["zero", "0-10%", "10-30%", "30-60%", ">60%"]
 _VOLUME_BUCKET_ORDER = ["<10", "10-100", "100-1k", ">1k"]
+
+# Thumbnail size kept small so the browser displays them at native resolution (no upscaling blur)
+_THUMB_SIZE = (3.2, 2.0)
+_THUMB_DPI  = 160
 
 
 # ============================================================
@@ -37,14 +41,14 @@ _VOLUME_BUCKET_ORDER = ["<10", "10-100", "100-1k", ">1k"]
 
 def _fig_to_b64(fig: plt.Figure) -> str:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=110)
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=_THUMB_DPI)
     plt.close(fig)
     buf.seek(0)
     return base64.b64encode(buf.read()).decode("ascii")
 
 
-def _img_tag(b64: str) -> str:
-    return f'<img src="data:image/png;base64,{b64}" style="max-width:100%;"/>'
+def _img_tag(b64: str, style: str = "max-width:100%;") -> str:
+    return f'<img src="data:image/png;base64,{b64}" style="{style}"/>'
 
 
 def _df_to_html_table(df: pd.DataFrame, float_fmt: str = ".4f") -> str:
@@ -58,7 +62,6 @@ def _df_to_html_table(df: pd.DataFrame, float_fmt: str = ".4f") -> str:
             val = row[col]
             if isinstance(val, float):
                 cell = f"{val:{float_fmt}}"
-                # colour-code MAE columns
                 if "mae" in col.lower():
                     if val < 0.05:
                         style = "background:#d4edda;"
@@ -74,6 +77,22 @@ def _df_to_html_table(df: pd.DataFrame, float_fmt: str = ".4f") -> str:
         rows.append("</tr>")
     rows.append("</tbody></table>")
     return "\n".join(rows)
+
+
+def _render_individual_charts(charts: list[tuple[str, str]]) -> str:
+    """Render a list of (label, base64_png) pairs in a 2-column grid."""
+    items = "".join(
+        f'<figure style="margin:0;">'
+        f'<img src="data:image/png;base64,{b64}"'
+        f' style="width:100%;display:block;border:1px solid #ddd;border-radius:4px;"/>'
+        f'<figcaption style="font-size:.75rem;text-align:center;color:#555;padding:.2rem 0;">'
+        f'{label}</figcaption></figure>'
+        for label, b64 in charts
+    )
+    return (
+        '<div style="display:grid;grid-template-columns:repeat(2,1fr);'
+        f'gap:.75rem;margin-bottom:1.5rem;">{items}</div>'
+    )
 
 
 # ============================================================
@@ -119,7 +138,7 @@ def _render_mae_section(summary: dict) -> str:
 
 
 # ============================================================
-# Section 2 — Top recovery performers
+# Section 2 — Highest-risk groups
 # ============================================================
 
 def _top_n_by_rate(df: pd.DataFrame, group_col: str, n: int) -> pd.DataFrame:
@@ -145,12 +164,12 @@ def _render_performers_section(df: pd.DataFrame, top_n: int) -> str:
     site_tbl = _top_n_by_rate(df, "hashed_fc", top_n)
     html = [
         "<section>",
-        f"<h2>Highest-Risk Groups (Elevated Recovery Rate)</h2>",
+        "<h2>Highest-Risk Groups (Elevated Recovery Rate)</h2>",
         "<p>A higher recovery rate indicates more product being returned, donated, or disposed of "
         "rather than sold. The groups below warrant the most attention.</p>",
-        f"<h3>GL Product Groups</h3>",
+        "<h3>GL Product Groups</h3>",
         _df_to_html_table(gl_tbl),
-        f"<h3>Sites</h3>",
+        "<h3>Sites</h3>",
         _df_to_html_table(site_tbl),
         "</section>",
     ]
@@ -161,27 +180,56 @@ def _render_performers_section(df: pd.DataFrame, top_n: int) -> str:
 # Section 3 — Weekly trend charts
 # ============================================================
 
+def _find_always_full_recovery(df: pd.DataFrame, group_col: str) -> list[str]:
+    """Return group values where prob_recovered == 1.0 for every row."""
+    if "prob_recovered" not in df.columns:
+        return []
+    mask = df.groupby(group_col)["prob_recovered"].apply(lambda s: (s == 1.0).all())
+    return mask[mask].index.tolist()
+
+
+def _render_always_full_note(gl_full: list[str], site_full: list[str]) -> str:
+    if not gl_full and not site_full:
+        return ""
+    parts = [
+        '<div class="always-full-note">',
+        "<strong>Excluded from charts (100% recovery rate across all weeks):</strong>",
+    ]
+    if gl_full:
+        listed = ", ".join(f"<code>{v}</code>" for v in gl_full)
+        parts.append(f"<br/><em>GL Groups:</em> {listed}")
+    if site_full:
+        listed = ", ".join(f"<code>{v}</code>" for v in site_full)
+        parts.append(f"<br/><em>Sites:</em> {listed}")
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
 def _chart_weekly_single(
     df: pd.DataFrame,
     group_col: str,
     group_val: str,
+    pred_col: str = "combined_rate",
+    actual_col: str | None = "prob_recovered",
 ) -> str:
-    subset = df[df[group_col] == group_val]
-    weekly = subset.groupby("week")["combined_rate"].mean().reset_index()
+    subset  = df[df[group_col] == group_val]
+    weekly  = subset.groupby("week")[pred_col].mean().reset_index()
 
-    fig, ax = plt.subplots(figsize=(5, 3))
-    ax.plot(weekly["week"], weekly["combined_rate"], marker="o", color="#1f77b4", label="Predicted")
-    if "prob_recovered" in subset.columns:
-        gt = subset.groupby("week")["prob_recovered"].mean().reset_index()
-        ax.plot(gt["week"], gt["prob_recovered"], marker="o", linestyle="--",
+    fig, ax = plt.subplots(figsize=_THUMB_SIZE)
+    ax.plot(weekly["week"], weekly[pred_col],
+            marker=".", markersize=4, linewidth=1.2, color="#1f77b4", label="Predicted")
+    if actual_col and actual_col in subset.columns:
+        gt = subset.groupby("week")[actual_col].mean().reset_index()
+        ax.plot(gt["week"], gt[actual_col],
+                marker=".", markersize=4, linewidth=1.2, linestyle="--",
                 color="#ff7f0e", label="Actual")
-        ax.legend(fontsize=7)
-    ax.set_xlabel("Week", fontsize=8)
-    ax.set_ylabel("Recovery rate", fontsize=8)
-    ax.set_title(group_val, fontsize=9)
-    ax.tick_params(labelsize=7)
+        ax.legend(fontsize=6, loc="best", handlelength=1.5)
+    ax.set_xlabel("Week", fontsize=7)
+    ax.set_ylabel("Rate", fontsize=7)
+    ax.set_title(group_val, fontsize=8)
+    ax.tick_params(labelsize=6)
     ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    fig.tight_layout(pad=0.4)
     return _fig_to_b64(fig)
 
 
@@ -189,64 +237,71 @@ def _charts_weekly_individual(
     df: pd.DataFrame,
     group_col: str,
     top_n: int,
+    pred_col: str = "combined_rate",
+    actual_col: str | None = "prob_recovered",
 ) -> list[tuple[str, str]]:
+    if pred_col not in df.columns:
+        return []
     top_vals = (
-        df.groupby(group_col)["combined_rate"]
+        df.groupby(group_col)[pred_col]
         .mean()
         .sort_values(ascending=False)
         .head(top_n)
         .index.tolist()
     )
-    return [(val, _chart_weekly_single(df, group_col, val)) for val in top_vals]
-
-
-def _chart_weekly_channels(df: pd.DataFrame) -> str | None:
-    pred_cols = [f"pred_{ch}" for ch in RECOVERY_CHANNELS if f"pred_{ch}" in df.columns]
-    if not pred_cols:
-        return None
-
-    weekly = df.groupby("week")[pred_cols].mean().reset_index()
-
-    fig, ax = plt.subplots(figsize=(9, 4))
-    for col in pred_cols:
-        channel_key = col.removeprefix("pred_")
-        label = _CHANNEL_LABELS.get(channel_key, channel_key)
-        ax.plot(weekly["week"], weekly[col], marker="o", label=label)
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Predicted channel rate")
-    ax.set_title("Predicted Recovery Rate per Channel by Week")
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    return _fig_to_b64(fig)
-
-
-def _render_individual_charts(charts: list[tuple[str, str]]) -> str:
-    items = "".join(
-        f'<figure style="margin:0;">'
-        f'<img src="data:image/png;base64,{b64}" style="width:100%;border:1px solid #ddd;border-radius:4px;"/>'
-        f'<figcaption style="font-size:.8rem;text-align:center;color:#555;">{label}</figcaption>'
-        f'</figure>'
-        for label, b64 in charts
-    )
-    return f'<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;margin-bottom:1.5rem;">{items}</div>'
+    return [
+        (val, _chart_weekly_single(df, group_col, val, pred_col, actual_col))
+        for val in top_vals
+    ]
 
 
 def _render_trend_section(df: pd.DataFrame, top_n: int) -> str:
-    gl_charts   = _charts_weekly_individual(df, "gl_product_group", top_n)
-    site_charts = _charts_weekly_individual(df, "hashed_fc", top_n)
-    b64_channels = _chart_weekly_channels(df)
+    has_gt = "prob_recovered" in df.columns
 
-    html = [
-        "<section>",
-        "<h2>Recovery Rate Trend over Week</h2>",
-        f"<h3>Top {top_n} GL Product Groups</h3>",
-        _render_individual_charts(gl_charts),
-        f"<h3>Top {top_n} Sites</h3>",
-        _render_individual_charts(site_charts),
-    ]
-    if b64_channels:
-        html += ["<h3>Per-Channel Breakdown</h3>", _img_tag(b64_channels)]
+    # Identify and exclude always-full-recovery groups
+    gl_full   = _find_always_full_recovery(df, "gl_product_group")
+    site_full = _find_always_full_recovery(df, "hashed_fc")
+    df_plot   = df[
+        ~df["gl_product_group"].isin(gl_full) & ~df["hashed_fc"].isin(site_full)
+    ].copy() if (gl_full or site_full) else df
+
+    html = ["<section>", "<h2>Recovery Rate Trend over Week</h2>"]
+
+    note = _render_always_full_note(gl_full, site_full)
+    if note:
+        html.append(note)
+
+    # --- Overall combined_rate ---
+    actual_overall = "prob_recovered" if has_gt else None
+
+    html.append(f"<h3>Overall — Top {top_n} GL Product Groups</h3>")
+    html.append(_render_individual_charts(
+        _charts_weekly_individual(df_plot, "gl_product_group", top_n, "combined_rate", actual_overall)
+    ))
+
+    html.append(f"<h3>Overall — Top {top_n} Sites</h3>")
+    html.append(_render_individual_charts(
+        _charts_weekly_individual(df_plot, "hashed_fc", top_n, "combined_rate", actual_overall)
+    ))
+
+    # --- Per-channel breakdown ---
+    for channel in RECOVERY_CHANNELS:
+        pred_col   = f"pred_{channel}"
+        actual_col = channel if (has_gt and channel in df_plot.columns) else None
+        if pred_col not in df_plot.columns:
+            continue
+        label = _CHANNEL_LABELS.get(channel, channel)
+
+        html.append(f"<h3>{label} — Top {top_n} GL Product Groups</h3>")
+        html.append(_render_individual_charts(
+            _charts_weekly_individual(df_plot, "gl_product_group", top_n, pred_col, actual_col)
+        ))
+
+        html.append(f"<h3>{label} — Top {top_n} Sites</h3>")
+        html.append(_render_individual_charts(
+            _charts_weekly_individual(df_plot, "hashed_fc", top_n, pred_col, actual_col)
+        ))
+
     html.append("</section>")
     return "\n".join(html)
 
@@ -275,7 +330,7 @@ def _chart_shap_attribution(df: pd.DataFrame, top_n: int = 5) -> str:
         .head(top_n)
     )
 
-    fig, ax = plt.subplots(figsize=(9, 4))
+    fig, ax = plt.subplots(figsize=(8, 3.5))
     x = np.arange(len(site_shap))
     ax.bar(x, site_shap["baseline"],  label="Baseline rate",          color="#4c72b0")
     ax.bar(x, site_shap["deviation"], bottom=site_shap["baseline"],
@@ -296,7 +351,6 @@ def _render_shap_section(df: pd.DataFrame, top_n: int) -> str:
 
     b64 = _chart_shap_attribution(df, min(top_n, 5))
 
-    # Callout: site with highest positive deviation
     site_dev = (
         df.groupby("hashed_fc")["shap_deviation_contribution"].mean()
         .sort_values(ascending=False)
@@ -309,7 +363,7 @@ def _render_shap_section(df: pd.DataFrame, top_n: int) -> str:
         "<h2>SHAP Attribution: Baseline vs Current-Week Deviation</h2>",
         "<p>The stacked bars show how much of each site's recovery rate comes from its "
         "historical site-GL baseline (blue) versus signals from the current week (orange).</p>",
-        _img_tag(b64),
+        _img_tag(b64, style="max-width:100%;"),
         f"<p><strong>Callout:</strong> Site <code>{best_site}</code> has the largest "
         f"current-week deviation above its historical baseline (<strong>+{best_dev:.4f}</strong>), "
         "indicating it is at <strong>heightened risk</strong> this period beyond what its "
@@ -325,17 +379,22 @@ def _render_shap_section(df: pd.DataFrame, top_n: int) -> str:
 
 _CSS = """
 <style>
-  body { font-family: Arial, sans-serif; margin: 2rem; color: #333; }
-  h1   { color: #1a1a2e; border-bottom: 2px solid #1a1a2e; padding-bottom: .3rem; }
-  h2   { color: #16213e; margin-top: 2rem; }
-  h3   { color: #0f3460; }
-  table{ border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; font-size: .9rem; }
+  body  { font-family: Arial, sans-serif; margin: 2rem; color: #333; }
+  h1    { color: #1a1a2e; border-bottom: 2px solid #1a1a2e; padding-bottom: .3rem; }
+  h2    { color: #16213e; margin-top: 2rem; }
+  h3    { color: #0f3460; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 1.5rem; font-size: .9rem; }
   th, td { border: 1px solid #ccc; padding: .4rem .7rem; text-align: left; }
-  th   { background: #e8eaf6; }
+  th    { background: #e8eaf6; }
   tr:nth-child(even) { background: #f9f9f9; }
-  img  { margin: .5rem 0 1rem; border: 1px solid #ddd; border-radius: 4px; }
+  img   { margin: .25rem 0; border: 1px solid #ddd; border-radius: 4px; }
   section { margin-bottom: 2.5rem; }
-  p    { line-height: 1.5; }
+  p     { line-height: 1.5; }
+  .always-full-note {
+    background: #fff3cd; border: 1px solid #ffc107;
+    padding: .6rem 1rem; border-radius: 4px;
+    margin-bottom: 1rem; font-size: .88rem; line-height: 1.6;
+  }
 </style>
 """
 
@@ -392,7 +451,8 @@ class Report(PipelineStep):
     Sections:
       1. Model performance summary (overall MAE, MAE by rate/volume bucket)
       2. Highest-risk GL groups and sites by mean predicted recovery rate (high rate = bad outcome)
-      3. Individual recovery-rate trend charts per GL group and per site (top_n each) + per-channel
+      3. Individual trend charts per GL and per site for overall rate + each recovery channel;
+         groups with 100% actual recovery are listed and excluded from charts
       4. SHAP baseline-vs-deviation attribution for highest-risk sites (skipped when SHAP not run)
 
     The HTML string is stored in ContextKeys.REPORT and optionally uploaded to S3.
