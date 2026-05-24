@@ -141,3 +141,10 @@ class ContextKeys:
     SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 4 per-channel share regressors
     PREDICTIONS = "predictions"     # output Polars DataFrame from Predict step
     REPORT = "report"               # HTML string produced by Report step
+
+
+# ============================================================
+# MODEL TRAINING CONFIG
+# ============================================================
+DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
+DEFAULT_TEST_YEARS: list[int] = [2025]

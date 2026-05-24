@@ -294,8 +294,8 @@ class Predict(PipelineStep):
     """
     Loads preprocessed data + all three model types (from context or S3),
     applies optional row filters (site / GL / year / week), runs Stage 1
-    (classifier → p_nonzero), Stage 2 (regressor → e_rate), Stage 3
-    (per-channel share regressors → 4 absolute channel rates), and optionally
+    (classifier -> p_nonzero), Stage 2 (regressor -> e_rate), Stage 3
+    (per-channel share regressors -> 4 absolute channel rates), and optionally
     SHAP decomposition.
 
     Output is a Polars DataFrame stored in ContextKeys.PREDICTIONS with columns:
@@ -390,7 +390,7 @@ class Predict(PipelineStep):
             shap_deviation_contribution[idx] = deviation_sample
 
         # 9. Assemble output DataFrame
-        # Column order: identifiers → (real → predicted → abs_err) per prediction group → diagnostics
+        # Column order: identifiers -> (real -> predicted -> abs_err) per prediction group -> diagnostics
         has_gt = "prob_recovered" in df.columns
 
         out = df.select(["hashed_fc", "gl_product_group", "year", "week"])
@@ -411,7 +411,7 @@ class Predict(PipelineStep):
                 pl.Series("abs_err", np.round(np.abs(combined_rate - y_true), 6))
             )
 
-        # Per-channel group: real → predicted → abs_err
+        # Per-channel group: real -> predicted -> abs_err
         if self.predict_channels:
             for channel in RECOVERY_CHANNELS:
                 pred_col = np.round(channel_rates[channel], 6)

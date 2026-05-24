@@ -15,7 +15,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 # local
-from src.config import ContextKeys, S3_BUCKET, SHARE_MODELS_S3_PREFIX
+from src.config import ContextKeys, S3_BUCKET, SHARE_MODELS_S3_PREFIX, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
@@ -28,14 +28,6 @@ logger = logging.getLogger(__name__)
 # Channel + feature constants
 # ============================================================
 
-# Per-channel target column names (each is a share of total units in the parquet).
-# Consolidated from raw sub-channels (see preprocess_step._CHANNEL_CONSOLIDATION):
-#   donations          = donations + bintool_donations
-#   disposal           = remove_return + bintool_remove_liquidate + remove_liquidate
-#   liquidations       = unchanged
-#   return_to_vendor   = unchanged
-#   warehouse_deals_and_gr = unchanged
-#   bintool_theft      = dropped
 RECOVERY_CHANNELS: list[str] = [
     "prob_donations",
     "prob_liquidations",
@@ -229,7 +221,7 @@ _DEFAULT_CHANNEL_PARAMS: dict[str, dict] = {
         "reg_alpha": 0.0008500602063823264,
         "reg_lambda": 0.105063075386338,
     },
-    "prob_disposal": {             # element-wise mean of the 4 tuned channels above
+    "prob_disposal": {
         "max_depth":        8,
         "learning_rate":    0.10303364894496688,
         "subsample":        0.7949352732615969,
@@ -241,8 +233,7 @@ _DEFAULT_CHANNEL_PARAMS: dict[str, dict] = {
     },
 }
 
-_DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
-_DEFAULT_TEST_YEARS: list[int] = [2025]
+
 
 
 # ============================================================
@@ -262,9 +253,6 @@ def _prob_mae(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """Custom XGBoost eval metric: MAE in original probability space."""
     return float(np.mean(np.abs(_sigmoid(y_pred) - _sigmoid(y_true))))
 
-# XGBoost names the eval metric column after func.__name__; set it explicitly so the
-# pruner callback key "validation_0-prob_mae" matches regardless of how this function
-# is imported or renamed.
 _prob_mae.__name__ = "prob_mae"
 
 
@@ -276,7 +264,6 @@ def _cast_categoricals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _polars_to_pandas_safe(df: pl.DataFrame) -> pd.DataFrame:
-    """Convert column-by-column to avoid arrow chunked-array peak memory."""
     data: dict = {}
     for col in df.columns:
         s = df[col]
@@ -442,12 +429,6 @@ def _train_final_model(
         )
         model.fit(X_train, y_train_lg, verbose=False)
 
-    pred = np.clip(_sigmoid(model.predict(X_test)), 0.0, 1.0)
-    # metrics = {
-    #     "mae":  float(mean_absolute_error(y_test, pred)),
-    #     "rmse": float(math.sqrt(mean_squared_error(y_test, pred))),
-    #     "r2":   float(r2_score(y_test, pred)),
-    # }
     return model
 
 
@@ -463,13 +444,8 @@ def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
         logger.exception("Failed to save channel-share model to s3://%s/%s", bucket, key)
         raise
 
-def _register_custom_metrics() -> None:
-    import __main__
-    if not hasattr(__main__, "_prob_mae"):
-        __main__._prob_mae = _prob_mae
 
 def _load_model_from_s3(bucket: str, key: str) -> XGBRegressor:
-    _register_custom_metrics()
     s3_client = boto3.client("s3")
     try:
         with tempfile.TemporaryFile() as fp:
@@ -526,8 +502,8 @@ class TrainPerChannelShareRegressors(PipelineStep):
     ):
         self.tune = tune
         self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
+        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
+        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
         self.read_from_key = read_from_key
         self.save_to_prefix = save_to_prefix or SHARE_MODELS_S3_PREFIX
 
@@ -580,17 +556,10 @@ class TrainPerChannelShareRegressors(PipelineStep):
                 model = _train_final_model(
                     X_train, X_test, y_train, y_test, best_params,
                 )
-                # logger.info(
-                #     "  channel=%s  best_iter=%s  MAE=%.4f  R2=%.4f",
-                #     channel, model.best_iteration, metrics["mae"], metrics["r2"],
-                # )
-
-                # Persist baseline + metadata on the model so a single joblib artifact
-                # is sufficient for downstream inference.
                 model.site_gl_baseline_ = site_gl_baseline
                 model.aug_features_ = aug_features
                 model.channel_ = channel
-                # model.metrics_ = metrics
+
 
                 _save_model_to_s3(model, S3_BUCKET, f"{save_prefix}/{channel}_share.joblib")
 

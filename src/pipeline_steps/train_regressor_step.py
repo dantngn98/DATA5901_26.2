@@ -13,7 +13,7 @@ from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
 # local
-from src.config import ContextKeys, REG_MODEL_S3_KEY, S3_BUCKET
+from src.config import ContextKeys, REG_MODEL_S3_KEY, S3_BUCKET, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
@@ -50,9 +50,6 @@ _DEFAULT_REG_PARAMS: dict = {
     "reg_lambda": 1.0,
 }
 
-_DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
-_DEFAULT_TEST_YEARS: list[int] = [2025]
-
 
 # ============================================================
 # Transform helpers
@@ -71,14 +68,11 @@ def _prob_mae(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """Custom XGBoost eval metric: MAE in original probability space."""
     return float(np.mean(np.abs(_sigmoid(y_pred) - _sigmoid(y_true))))
 
-# XGBoost names the eval metric column after func.__name__; set it explicitly so the
-# pruner callback key "validation_0-prob_mae" matches regardless of how this function
-# is imported or renamed.
 _prob_mae.__name__ = "prob_mae"
 
 
 def _compute_weights(y: np.ndarray) -> np.ndarray:
-    """Sample weights emphasising the 10–60% recovery rate band."""
+    """Sample weights emphasising the 10-60% recovery rate band."""
     w = np.ones(len(y))
     w[(y >= 0.1) & (y < 0.3)] = 3.0
     w[(y >= 0.3) & (y < 0.6)] = 8.0
@@ -138,7 +132,7 @@ def _holdout_site_gl_baseline(
     holdout_frac: float = 0.05,
     seed: int = 42,
 ) -> pl.DataFrame:
-    """Remove `holdout_frac` of site–GL pairs so XGBoost learns splits on prior-filled rows."""
+    """Remove `holdout_frac` of site-GL pairs so XGBoost learns splits on prior-filled rows."""
     holdout_pairs = (
         site_gl_baseline
         .select(["hashed_fc", "gl_product_group"])
@@ -154,7 +148,7 @@ def _holdout_site_gl_baseline(
 
 
 def _fill_site_gl_baseline(df: pl.DataFrame, priors: dict) -> pl.DataFrame:
-    """Fill NaN baseline cols using GL → site → global fallback hierarchy."""
+    """Fill NaN baseline cols using GL -> site -> global fallback hierarchy."""
     df = df.join(priors["gl_baseline"], on="gl_product_group", how="left")
     df = df.join(priors["site_baseline"], on="hashed_fc", how="left")
     df = df.with_columns([
@@ -389,8 +383,8 @@ class TrainRegressor(PipelineStep):
     ):
         self.tune = tune
         self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
+        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
+        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
         self.holdout_frac = holdout_frac
         self.holdout_seed = holdout_seed
         self.read_from_key = read_from_key

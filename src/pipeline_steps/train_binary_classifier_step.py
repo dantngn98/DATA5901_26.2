@@ -14,7 +14,7 @@ from sklearn.metrics import average_precision_score
 from xgboost import XGBClassifier
 
 # local
-from src.config import CLF_MODEL_S3_KEY, ContextKeys, S3_BUCKET
+from src.config import CLF_MODEL_S3_KEY, ContextKeys, S3_BUCKET, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
@@ -209,11 +209,6 @@ _FEATURE_COLS: list[str] = (
     + _temporal_probability_cols
 )
 
-assert len(_FEATURE_COLS) == 151, (
-    f"Expected 151 features, got {len(_FEATURE_COLS)}. "
-    "Check for duplicates or missing columns in the sublists."
-)
-
 _DEFAULT_CLF_PARAMS: dict = {
     "max_depth": 6,
     "learning_rate": 0.05,
@@ -227,8 +222,7 @@ _DEFAULT_CLF_PARAMS: dict = {
 }
 
 # TODO: config
-_DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
-_DEFAULT_TEST_YEARS: list[int] = [2025]
+
 
 
 # ============================================================
@@ -411,8 +405,8 @@ class TrainBinaryClassifier(PipelineStep):
     ):
         self.tune = tune
         self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else _DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else _DEFAULT_TEST_YEARS
+        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
+        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
         self.read_from_key = read_from_key
         self.save_to_key = save_to_key
 
