@@ -1,9 +1,8 @@
 # standard
-from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
 from functools import wraps
 from types import MappingProxyType
-from typing import Any, Self
+from typing import Any, Self, Hashable, Mapping, Iterable
 
 
 @dataclass(slots=True, frozen=True)
@@ -272,10 +271,10 @@ class WeightedDigraph[K: Hashable]:
     @classmethod
     def from_dict[K: Hashable](
         cls,
-        edges: dict[K, list[K] | dict[K, dict[str, Any]]],
-        vertex_attributes: dict[K, dict[str, Any]] | None = None,
-        default_vertex_attributes: dict[str, Any] | None = None,
-        default_edge_attributes: dict[str, Any] | None = None
+        edges: Mapping[K, Iterable[K] | Mapping[K, Mapping[str, Any]]],
+        vertex_attributes: Mapping[K, Mapping[str, Any]] | None = None,
+        default_vertex_attributes: Mapping[str, Any] | None = None,
+        default_edge_attributes: Mapping[str, Any] | None = None
     ) -> Self:
         vertex_attributes = vertex_attributes if vertex_attributes is not None else {}
 
@@ -286,18 +285,17 @@ class WeightedDigraph[K: Hashable]:
             G.add_vertex(vertex, allow_exists=False, **attributes)
 
         # ensure vertices in edges, create edges
-        for start, end_list_or_dict in edges.items():
+        for start, end_iter_or_mapping in edges.items():
             G.add_vertex(start, allow_exists=True, **vertex_attributes.get(start, {}))
 
-            if isinstance(end_list_or_dict, list):
-                for end in end_list_or_dict:
-                    G.add_vertex(end, allow_exists=True)
-                    G.add_edge(start, end, allow_create_vertices=False)
-            else:
-                assert isinstance(end_list_or_dict, dict)
-                for end, attributes in end_list_or_dict.items():
+            if isinstance(end_iter_or_mapping, Mapping):
+                for end, attributes in end_iter_or_mapping.items():
                     G.add_vertex(end, allow_exists=True, **vertex_attributes.get(end, {}))
                     G.add_edge(start, end, allow_create_vertices=False, **attributes)
+            else:  # assume Iterable[K]
+                for end in end_iter_or_mapping:  
+                    G.add_vertex(end, allow_exists=True)
+                    G.add_edge(start, end, allow_create_vertices=False)
         
         return G
 

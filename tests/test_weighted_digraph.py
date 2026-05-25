@@ -3,7 +3,7 @@ import pytest
 from types import MappingProxyType
 
 # local
-from src.cost_model.weighted_digraph import WeightedDigraph, Vertex, Edge
+from src.lifecycle_model.weighted_digraph import WeightedDigraph, Vertex, Edge
 
 
 # =========================================================

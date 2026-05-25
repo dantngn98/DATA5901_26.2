@@ -1,10 +1,15 @@
 # standard
+from dataclasses import dataclass
 from enum import Enum
+from typing import Sequence
 
-class State(Enum):
+# local
+from src.lifecycle_model.types import CostingDimension
+
+class LifecycleState(Enum):
     # "active" inventory
     INITIAL_RECEPTION = "initial_reception"
-    SELLABLE_INVENTORY = "sellable"
+    SELLABLE_INVENTORY = "sellable_inventory"
     RETURNED = "returned"
 
     # non-recovery funnel (outcome pending)
@@ -19,22 +24,17 @@ class State(Enum):
     SEEKING_DISPOSAL = "seeking_disposal"
 
     # recovery funnel outcomes
-    WAREHOUSE_DEALS_AND_GRADE_RESELL = "warehouse_deals_and_grade_resell"
     RETURNED_TO_VENDOR = "returned_to_vendor"
+    WAREHOUSE_DEALS_AND_GRADE_RESELL = "warehouse_deals_and_grade_resell"
     LIQUIDATED = "liquidated"
     DONATED = "donated"
     DISPOSED = "disposed"
 
+@dataclass(slots=True, frozen=True)
+class LifecycleStep:
+    start_state: LifecycleState
+    end_state: LifecycleState
+    realized_wait_time: float
+    costs: dict[CostingDimension, float]
 
-class CostingDimensions(Enum):
-    # inventory
-    STORAGE = "storage"
-    OPPORTUNITY_COST = "opportunity_cost"
-
-    # movement/processing
-    LABOR = "labor"
-    TRANSPORTATION = "transportation"
-
-    # non-full sale
-    LOST_REVENUE = "lost_revenue"
-    RECOVERY_FUNNEL = "recovery_funnel"
+Lifecycle = Sequence[LifecycleStep]
