@@ -4,6 +4,7 @@ from src.pipeline_steps.train_binary_classifier_step import TrainBinaryClassifie
 from src.pipeline_steps.train_regressor_step import TrainRegressor
 from src.pipeline_steps.train_per_channel_share_step import TrainPerChannelShareRegressors
 from src.pipeline_steps.predict_step import Predict
+from src.pipeline_steps.report_step import Report
 
 __all__ = [
     "Load",
@@ -12,4 +13,5 @@ __all__ = [
     "TrainRegressor",
     "TrainPerChannelShareRegressors",
     "Predict",
+    "Report",
 ]

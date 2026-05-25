@@ -40,17 +40,17 @@ s3://msds-26.2-data/
 │       ├── prob_bintool_remove_liquidate_reg.joblib
 │       └── ...
 """
-
-S3_BUCKET = S3Path(bucket="msds-26.2-data")
+# === S3 data storage ===
+S3_BUCKET_URI = "s3://msds-26.2-data"
 YEARLY_RECOVERY_DATA_CSV_FPS = [
-    f"{S3_BUCKET}/sanitized_{year}.csv"
+    str(f"{S3_BUCKET_URI}/data/unprocessed/sanitized_{year}.csv")
     for year in range(2022, 2026)
 ]
-MODEL_DIR = S3_BUCKET/"model"
-CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"
-REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"
-SHARE_MODELS_DIR = MODEL_DIR/"recovery_channel_regression"
-PREDICTIONS_PARQUET = MODEL_DIR/"predictions.parquet"
+# MODEL_DIR = S3_BUCKET/"model"
+# CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"
+# REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"
+# SHARE_MODELS_DIR = MODEL_DIR/"recovery_channel_regression"
+PREDICTIONS_PARQUET = f"{S3_BUCKET_URI}/out/predictions.parquet"
 
 
 # === S3 model storage ===
@@ -60,6 +60,7 @@ CLF_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_classification_model.joblib"
 REG_MODEL_S3_KEY = f"{MODEL_DIR}/tuned_xgboost_regression_model.joblib"
 SHARE_MODELS_S3_PREFIX = f"{MODEL_DIR}/recovery_channel_share_softmax"  # per-channel share regressors live under this prefix
 PREDICTIONS_S3_KEY = f"{MODEL_DIR}/predictions.parquet"
+REPORT_S3_KEY = "out/report.html"
 
 
 # ============================================================
@@ -139,3 +140,11 @@ class ContextKeys:
     REG_MODEL = "reg_model"         # trained XGBRegressor (Stage 2)
     SHARE_MODELS = "share_models"   # dict[channel_name -> XGBRegressor], 4 per-channel share regressors
     PREDICTIONS = "predictions"     # output Polars DataFrame from Predict step
+    REPORT = "report"               # HTML string produced by Report step
+
+
+# ============================================================
+# MODEL TRAINING CONFIG
+# ============================================================
+DEFAULT_TRAIN_YEARS: list[int] = [2022, 2023, 2024]
+DEFAULT_TEST_YEARS: list[int] = [2025]
