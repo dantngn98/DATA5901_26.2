@@ -7,7 +7,7 @@ from src.config import ContextKeys, CSV_DELIMITER
 from src.pipeline import Context, enforce
 from src.pipeline.types import PipelineStep
 from src.pipeline.conditions import Defines, Locks, Sequence
-from src.util import load
+from src.util import load_dataframe, S3Path
 
 
 logger = logging.getLogger(__name__)
@@ -22,12 +22,12 @@ class Load(PipelineStep):
     the resultant dataframes together.
     """
 
-    def __init__(self, recovery_data_source: str | Iterable[str]):
+    def __init__(self, recovery_data_source: (str | S3Path) | Iterable[str | S3Path]):
         self.recovery_data_source = recovery_data_source
 
     def __call__(self, context: Context) -> Context:
         logger.info(f"loading data from {self.recovery_data_source}")
-        context[ContextKeys.DF_RECOVERY_LOADED] = load(self.recovery_data_source, CSV_DELIMITER)
+        context[ContextKeys.DF_RECOVERY_LOADED] = load_dataframe(self.recovery_data_source, CSV_DELIMITER)
         logger.info("data loaded")
         context.lock(ContextKeys.DF_RECOVERY_LOADED)
         return context

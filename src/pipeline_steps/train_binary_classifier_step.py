@@ -1,10 +1,7 @@
 # standard
 import logging
-import tempfile
 
 # third-party
-import boto3
-import joblib
 import numpy as np
 import optuna
 import pandas as pd
@@ -14,227 +11,97 @@ from sklearn.metrics import average_precision_score
 from xgboost import XGBClassifier
 
 # local
-from src.config import CLF_MODEL_S3_KEY, ContextKeys, S3_BUCKET, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
+from src.config import (
+    CATEGORICAL_COLUMNS,
+    RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_TARGET_COLUMN, RECOVERY_RATE_CLF_DEFAULT_PARAMS, 
+    ContextKeys
+)
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
-from src.util import load
+from src.util import (
+    load_joblib_from_s3, write_joblib_to_s3,
+    cast_categoricals,
+    S3Path
+)
+
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# Feature and category constants
+# Pipeline step
 # ============================================================
 
-_CAT_COLS: list[str] = [
-    "hashed_fc",
-    "gl_product_group",
-    "country",
-    "country_state",
-    "site_type",
-    "site_category",
-]
+@enforce({
+    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from makes it optional
+    ContextKeys.CLF_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
+})
+class TrainBinaryClassifier(PipelineStep):
+    """
+    Define the binary classification model, either by loading a pre-trained model from S3 or 
+    by training a new XGBoost classifier on the training data output by the preprocessing step.
+    
+    Trains a binary classifier predicting P(prob_recovered > 0), saves the model
+    to S3, and stores it in context under ContextKeys.CLF_MODEL.
+    """
 
-_gl_composition_cols: list[str] = [
-    "share_food", "share_non_food", "share_pet_food",
-    "share_RETAIL", "share_FBA", "share_hazmat",
-]
+    def __init__(
+        self,
+        train_years: list[int],
+        test_years: list[int],
+        tune: bool = False,
+        n_trials: int = 50,
+        read_from: S3Path | None = None,
+        save_to: S3Path | None = None,
+    ):
+        self.train_years = train_years
+        self.test_years = test_years
+        self.tune = tune
+        self.n_trials = n_trials
+        self.read_from = read_from
+        self.save_to = save_to
 
-_gl_volume_cols: list[str] = [
-    "units_total", "cogs_total", "weight_total",
-    "avg_cogs_per_unit", "avg_weight_per_unit", "cogs_per_unit_weight",
-]
+    def __call__(self, context: Context) -> Context:
+        if self.read_from_key is not None:
+            logger.info(f"loading binary classifier from '{self.read_from.uri}'")
+            model = load_joblib_from_s3(self.read_from)
+            logger.info(f"loaded {type(model)} object")
+            assert isinstance(model, XGBClassifier)
+        else:
+            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
-_gl_at_site_cols: list[str] = [
-    "site_units_share_week", "site_weight_share_week",
-]
+            X_train, X_val, y_train, y_val, scale_pos_weight = _build_train_val_splits(
+                df, self.train_years, self.test_years
+            )
 
-_site_context_cols: list[str] = [
-    "site_units_total_week", "site_weight_total_week",
-    "site_type", "site_category", "country", "country_state",
-]
+            if self.tune:
+                best_params = _tune_with_optuna(
+                    X_train, X_val, y_train, y_val,
+                    scale_pos_weight=scale_pos_weight,
+                    n_trials=self.n_trials,
+                )
+            else:
+                best_params = RECOVERY_RATE_CLF_DEFAULT_PARAMS
 
-_temporal_site_context_cols: list[str] = [
-    "site_units_total_week_lag_1w",
-    "site_units_total_week_lag_4w",
-    "site_units_total_week_lag_12w",
-    "site_units_total_week_lag_13w",
-    "site_units_total_week_lag_52w",
-    "site_weight_total_week_lag_1w",
-    "site_weight_total_week_lag_4w",
-    "site_weight_total_week_lag_12w",
-    "site_weight_total_week_lag_13w",
-    "site_weight_total_week_lag_52w",
-    "site_prob_recovered_week_lag_1w",
-    "site_prob_recovered_week_lag_4w",
-    "site_prob_recovered_week_lag_12w",
-    "site_prob_recovered_week_lag_13w",
-    "site_prob_recovered_week_lag_52w",
-    "site_prob_recovered_week_rolling_4w",
-    "site_prob_recovered_week_rolling_12w",
-    "site_prob_recovered_week_rolling_26w",
-    "site_prob_recovered_week_rolling_52w",
-]
+            model = _train_final_model(
+                X_train, X_val, y_train, y_val,
+                scale_pos_weight=scale_pos_weight,
+                best_params=best_params,
+            )
 
-_calendar_cols: list[str] = ["month", "week"]
+        if self.save_to is not None and self.save_to != self.read_from:
+            logger.info(f"saving binary classifier to '{self.save_to.uri}'")
+            write_joblib_to_s3(model, self.save_to)
 
-_temporal_composition_cols: list[str] = [
-    "share_RETAIL_lag_1w",
-    "share_RETAIL_lag_4w",
-    "share_RETAIL_lag_12w",
-    "share_RETAIL_lag_13w",
-    "share_RETAIL_lag_52w",
-    "share_FBA_lag_1w",
-    "share_FBA_lag_4w",
-    "share_FBA_lag_12w",
-    "share_FBA_lag_13w",
-    "share_FBA_lag_52w",
-    "share_hazmat_lag_1w",
-    "share_hazmat_lag_4w",
-    "share_hazmat_lag_12w",
-    "share_hazmat_lag_13w",
-    "share_hazmat_lag_52w",
-    "share_food_lag_1w",
-    "share_food_lag_4w",
-    "share_food_lag_12w",
-    "share_food_lag_13w",
-    "share_food_lag_52w",
-    "share_non_food_lag_1w",
-    "share_non_food_lag_4w",
-    "share_non_food_lag_12w",
-    "share_non_food_lag_13w",
-    "share_non_food_lag_52w",
-    "share_pet_food_lag_1w",
-    "share_pet_food_lag_4w",
-    "share_pet_food_lag_12w",
-    "share_pet_food_lag_13w",
-    "share_pet_food_lag_52w",
-    "share_food_rolling_4w",
-    "share_food_rolling_12w",
-    "share_non_food_rolling_4w",
-    "share_non_food_rolling_12w",
-    "share_pet_food_rolling_4w",
-    "share_pet_food_rolling_12w",
-    "share_RETAIL_rolling_4w",
-    "share_RETAIL_rolling_12w",
-    "share_FBA_rolling_4w",
-    "share_FBA_rolling_12w",
-    "share_hazmat_rolling_4w",
-    "share_hazmat_rolling_12w",
-    "share_food_rolling_26w",
-    "share_food_rolling_52w",
-    "share_non_food_rolling_26w",
-    "share_non_food_rolling_52w",
-    "share_pet_food_rolling_26w",
-    "share_pet_food_rolling_52w",
-    "share_RETAIL_rolling_26w",
-    "share_RETAIL_rolling_52w",
-    "share_FBA_rolling_26w",
-    "share_FBA_rolling_52w",
-    "share_hazmat_rolling_26w",
-    "share_hazmat_rolling_52w",
-    "share_RETAIL_ewma_5a",
-    "share_RETAIL_ewma_1a",
-    "share_FBA_ewma_5a",
-    "share_FBA_ewma_1a",
-    "share_hazmat_ewma_5a",
-    "share_hazmat_ewma_1a",
-    "share_food_ewma_5a",
-    "share_food_ewma_1a",
-    "share_non_food_ewma_5a",
-    "share_non_food_ewma_1a",
-    "share_pet_food_ewma_5a",
-    "share_pet_food_ewma_1a",
-]
+        context[ContextKeys.CLF_MODEL] = model
+        context.lock(ContextKeys.CLF_MODEL)
 
-_temporal_volume_cols: list[str] = [
-    "units_total_lag_1w",
-    "units_total_lag_4w",
-    "units_total_lag_12w",
-    "units_total_lag_13w",
-    "units_total_lag_52w",
-    "cogs_total_lag_1w",
-    "cogs_total_lag_4w",
-    "cogs_total_lag_12w",
-    "cogs_total_lag_13w",
-    "cogs_total_lag_52w",
-    "weight_total_lag_1w",
-    "weight_total_lag_4w",
-    "weight_total_lag_12w",
-    "weight_total_lag_13w",
-    "weight_total_lag_52w",
-    "units_total_rolling_4w",
-    "units_total_rolling_12w",
-    "cogs_total_rolling_4w",
-    "cogs_total_rolling_12w",
-    "weight_total_rolling_4w",
-    "weight_total_rolling_12w",
-    "units_total_rolling_26w",
-    "units_total_rolling_52w",
-    "cogs_total_rolling_26w",
-    "cogs_total_rolling_52w",
-    "weight_total_rolling_26w",
-    "weight_total_rolling_52w",
-    "units_total_ewma_5a",
-    "units_total_ewma_1a",
-    "cogs_total_ewma_5a",
-    "cogs_total_ewma_1a",
-    "weight_total_ewma_5a",
-    "weight_total_ewma_1a",
-]
-
-_temporal_probability_cols: list[str] = [
-    "prob_recovered_lag_1w",
-    "prob_recovered_lag_4w",
-    "prob_recovered_lag_12w",
-    "prob_recovered_lag_13w",
-    "prob_recovered_lag_52w",
-    "prob_recovered_rolling_26w",
-    "prob_recovered_rolling_52w",
-    "prob_recovered_rolling_4w",
-    "prob_recovered_rolling_12w",
-    "prob_recovered_ewma_5a",
-    "prob_recovered_ewma_1a",
-]
-
-_FEATURE_COLS: list[str] = (
-    _gl_composition_cols
-    + _gl_volume_cols
-    + _gl_at_site_cols
-    + _site_context_cols
-    + _temporal_site_context_cols
-    + _calendar_cols
-    + _temporal_composition_cols
-    + _temporal_volume_cols
-    + _temporal_probability_cols
-)
-
-_DEFAULT_CLF_PARAMS: dict = {
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 5,
-    "gamma": 0.1,
-    "reg_alpha": 0.01,
-    "reg_lambda": 1.0,
-    "max_delta_step": 0,
-}
-
-# TODO: config
-
+        return context
 
 
 # ============================================================
 # Private helpers
 # ============================================================
-
-def _cast_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    for col in _CAT_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
-    return df
-
 
 def _build_train_val_splits(
     df: pl.DataFrame,
@@ -244,11 +111,12 @@ def _build_train_val_splits(
     df_train = df.filter(pl.col("year").is_in(train_years))
     df_val = df.filter(pl.col("year").is_in(test_years))
 
-    X_train = _cast_categoricals(df_train.select(_FEATURE_COLS).to_pandas())
-    X_val = _cast_categoricals(df_val.select(_FEATURE_COLS).to_pandas())
+    feature_columns = tuple(RECOVERY_RATE_CLF_FEATURE_COLUMNS)
+    X_train = cast_categoricals(df_train.select(feature_columns).to_pandas(), CATEGORICAL_COLUMNS)
+    X_val = cast_categoricals(df_val.select(feature_columns).to_pandas(), CATEGORICAL_COLUMNS)
 
-    y_train = (df_train["prob_recovered"].to_pandas().values > 0).astype(np.float32)
-    y_val = (df_val["prob_recovered"].to_pandas().values > 0).astype(np.float32)
+    y_train = (df_train[RECOVERY_RATE_TARGET_COLUMN].to_numpy() > 0).astype(np.float32)
+    y_val = (df_val[RECOVERY_RATE_TARGET_COLUMN].to_numpy() > 0).astype(np.float32)
 
     n_neg = int((y_train == 0).sum())
     n_pos = int((y_train == 1).sum())
@@ -339,106 +207,3 @@ def _train_final_model(
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
     logger.info("Stage 1 final model: best_iteration=%d", model.best_iteration)
     return model
-
-# TODO: implement these as load/write utils
-def _save_clf_to_s3(model: XGBClassifier, bucket: str, key: str) -> None:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            joblib.dump(model, fp)
-            fp.seek(0)
-            s3_client.put_object(Body=fp.read(), Bucket=bucket, Key=key)
-            logger.info("Classifier saved to s3://%s/%s", bucket, key)
-    except Exception:
-        logger.exception("Failed to save classifier to s3://%s/%s", bucket, key)
-        raise
-
-def _load_clf_from_s3(bucket: str, key: str) -> XGBClassifier:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            s3_client.download_fileobj(bucket, key, fp)
-            fp.seek(0)
-
-            model = joblib.load(fp)
-
-            if not isinstance(model, XGBClassifier):
-                raise ValueError("Object loaded from s3://%s/%s is not an instance of XGBClassifier")
-
-            logger.info("Classifier loaded from s3://%s/%s", bucket, key)
-            return model
-
-    except Exception:
-        logger.exception(
-            "Failed to load classifier from s3://%s/%s",
-            bucket,
-            key,
-        )
-        raise
-
-
-# ============================================================
-# Pipeline step
-# ============================================================
-
-@enforce({
-    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from_key makes it optional
-    ContextKeys.CLF_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
-})
-class TrainBinaryClassifier(PipelineStep):
-    """
-    Define the binary classification model, either by loading a pre-trained model from S3 or 
-    by training a new XGBoost classifier on the training data output by the preprocessing step.
-    
-    Trains a binary classifier predicting P(prob_recovered > 0), saves the model
-    to S3, and stores it in context under ContextKeys.CLF_MODEL.
-    """
-
-    def __init__(
-        self,
-        tune: bool = False,
-        n_trials: int = 50,
-        train_years: list[int] | None = None,
-        test_years: list[int] | None = None,
-        read_from_key: str | None = None,
-        save_to_key: str | None = None,
-    ):
-        self.tune = tune
-        self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
-        self.read_from_key = read_from_key
-        self.save_to_key = save_to_key
-
-    def __call__(self, context: Context) -> Context:
-        if self.read_from_key is not None:
-            model = _load_clf_from_s3(S3_BUCKET, self.read_from_key)
-        else:
-            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
-
-            X_train, X_val, y_train, y_val, scale_pos_weight = _build_train_val_splits(
-                df, self.train_years, self.test_years
-            )
-
-            if self.tune:
-                best_params = _tune_with_optuna(
-                    X_train, X_val, y_train, y_val,
-                    scale_pos_weight=scale_pos_weight,
-                    n_trials=self.n_trials,
-                )
-            else:
-                best_params = _DEFAULT_CLF_PARAMS
-
-            model = _train_final_model(
-                X_train, X_val, y_train, y_val,
-                scale_pos_weight=scale_pos_weight,
-                best_params=best_params,
-            )
-
-        if self.save_to_key is not None:
-            _save_clf_to_s3(model, S3_BUCKET, self.save_to_key)
-
-        context[ContextKeys.CLF_MODEL] = model
-        context.lock(ContextKeys.CLF_MODEL)
-
-        return context

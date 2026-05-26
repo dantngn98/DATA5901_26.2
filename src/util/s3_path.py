@@ -9,6 +9,15 @@ from typing import Self
 class S3Path:
     bucket: str
     key: PurePosixPath = field(default_factory=PurePosixPath)
+    uri: str = field(init=False)  # calculated from bucket and key
+
+    def __post_init__(self):
+        key_str = self.key.as_posix()
+        uri = (
+            f"s3://{self.bucket}" if key_str in ("", ".")
+            else f"s3://{self.bucket}/{key_str}"
+        )
+        object.__setattr__(self, "uri", uri)
 
     @classmethod
     def from_uri(cls, uri: str) -> Self:
@@ -26,13 +35,6 @@ class S3Path:
             bucket=parsed.netloc,
             key=PurePosixPath(parsed.path.lstrip("/")),
         )
-
-    @property
-    def uri(self) -> str:
-        key_str = self.key.as_posix()
-        if key_str in ("", "."):
-            return f"s3://{self.bucket}"
-        return f"s3://{self.bucket}/{key_str}"
 
     @property
     def name(self) -> str:
@@ -69,3 +71,6 @@ class S3Path:
             return NotImplemented
 
         return self.joinpath(other)
+    
+    def __fspath__(self):
+        return self.uri

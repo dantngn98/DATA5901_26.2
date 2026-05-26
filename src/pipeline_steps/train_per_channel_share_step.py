@@ -15,11 +15,11 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from xgboost import XGBRegressor
 
 # local
-from src.config import ContextKeys, S3_BUCKET, SHARE_MODELS_S3_PREFIX, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
+from src.config import ContextKeys, S3_BUCKET, SHARE_MODELS_S3_PREFIX, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS, CONSOLIDATED_RECOVERY_TYPES, ConsolidatedRecoveryTypes, CATEGORICAL_COLUMNS
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
-from src.util import load
+from src.util import cast_categoricals, load_joblib_from_s3, write_joblib_to_s3
 
 logger = logging.getLogger(__name__)
 
@@ -37,87 +37,7 @@ RECOVERY_CHANNELS: list[str] = [
 ]
 
 # Short channel names used to construct per-channel temporal feature names.
-_CHANNEL_SHORT_NAMES: list[str] = [
-    "donations",
-    "liquidations",
-    "return_to_vendor",
-    "warehouse_deals_and_gr",
-    "disposal",
-]
-
-_CAT_COLS: list[str] = [
-    "site_type", "site_category", "country", "country_state",
-]
-
-_GL_COMPOSITION_COLS: list[str] = [
-    "share_food", "share_non_food", "share_pet_food",
-    "share_RETAIL", "share_FBA", "share_hazmat",
-]
-
-_GL_VOLUME_COLS: list[str] = [
-    "units_total", "cogs_total", "weight_total",
-    "avg_cogs_per_unit", "avg_weight_per_unit", "cogs_per_unit_weight",
-]
-
-_GL_AT_SITE_COLS: list[str] = [
-    "site_units_share_week", "site_weight_share_week",
-]
-
-_SITE_CONTEXT_COLS: list[str] = [
-    "site_units_total_week", "site_weight_total_week",
-    "site_type", "site_category", "country", "country_state",
-]
-
-_TEMPORAL_SITE_CONTEXT_COLS: list[str] = (
-    [f"site_units_total_week_lag_{w}w" for w in [1, 4, 12, 13, 52]]
-    + [f"site_weight_total_week_lag_{w}w" for w in [1, 4, 12, 13, 52]]
-    + [f"site_prob_recovered_week_lag_{w}w" for w in [1, 4, 12, 13, 52]]
-    + [f"site_prob_recovered_week_rolling_{w}w" for w in [4, 12, 26, 52]]
-)
-
-_CALENDAR_COLS: list[str] = ["month", "week"]
-
-_TEMPORAL_COMPOSITION_COLS: list[str] = (
-    [
-        f"share_{c}_lag_{w}w"
-        for c in ["RETAIL", "FBA", "hazmat", "food", "non_food", "pet_food"]
-        for w in [1, 4, 12, 13, 52]
-    ]
-    + [
-        f"share_{c}_rolling_{w}w"
-        for c in ["food", "non_food", "pet_food", "RETAIL", "FBA", "hazmat"]
-        for w in [4, 12, 26, 52]
-    ]
-    + [
-        f"share_{c}_ewma_{a}"
-        for c in ["RETAIL", "FBA", "hazmat", "food", "non_food", "pet_food"]
-        for a in ["5a", "1a"]
-    ]
-)
-
-_TEMPORAL_VOLUME_COLS: list[str] = (
-    [
-        f"{v}_lag_{w}w"
-        for v in ["units_total", "cogs_total", "weight_total"]
-        for w in [1, 4, 12, 13, 52]
-    ]
-    + [
-        f"{v}_rolling_{w}w"
-        for v in ["units_total", "cogs_total", "weight_total"]
-        for w in [4, 12, 26, 52]
-    ]
-    + [
-        f"{v}_ewma_{a}"
-        for v in ["units_total", "cogs_total", "weight_total"]
-        for a in ["5a", "1a"]
-    ]
-)
-
-_TEMPORAL_PROBABILITY_COLS: list[str] = (
-    [f"prob_recovered_lag_{w}w" for w in [1, 4, 12, 13, 52]]
-    + [f"prob_recovered_rolling_{w}w" for w in [4, 12, 26, 52]]
-    + [f"prob_recovered_ewma_{a}" for a in ["5a", "1a"]]
-)
+_CHANNEL_SHORT_NAMES: list[str] = list(CONSOLIDATED_RECOVERY_TYPES) - set([ConsolidatedRecoveryTypes.SALES])
 
 _TEMPORAL_PER_CHANNEL_GL_COLS: list[str] = (
     [
@@ -256,13 +176,6 @@ def _prob_mae(y_pred: np.ndarray, y_true: np.ndarray) -> float:
 _prob_mae.__name__ = "prob_mae"
 
 
-def _cast_categoricals(df: pd.DataFrame) -> pd.DataFrame:
-    for col in _CAT_COLS:
-        if col in df.columns:
-            df[col] = df[col].astype("category")
-    return df
-
-
 def _polars_to_pandas_safe(df: pl.DataFrame) -> pd.DataFrame:
     data: dict = {}
     for col in df.columns:
@@ -327,8 +240,8 @@ def _build_channel_splits(
 
     aug_features = [c for c in feature_cols + _BASELINE_COLS if c in df_train_nz.columns]
 
-    X_train = _cast_categoricals(_polars_to_pandas_safe(df_train_nz.select(aug_features)))
-    X_test  = _cast_categoricals(_polars_to_pandas_safe(df_test_nz.select(aug_features)))
+    X_train = cast_categoricals(_polars_to_pandas_safe(df_train_nz.select(aug_features)), CATEGORICAL_COLUMNS)
+    X_test  = cast_categoricals(_polars_to_pandas_safe(df_test_nz.select(aug_features)), CATEGORICAL_COLUMNS)
 
     y_train = df_train_nz["_share"].to_numpy()
     y_test  = df_test_nz["_share"].to_numpy()

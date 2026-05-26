@@ -1,6 +1,7 @@
 # standard
 import logging
 from operator import eq, ne
+from os import PathLike
 from typing import Any, Callable
 
 # third-party
@@ -8,64 +9,20 @@ import numpy as np
 import polars as pl
 
 # local
-from src.config import CSV_DELIMITER, ContextKeys, RecoverySchema
+from src.config import (
+    RecoverySchema,
+    RecoveryTypes, RECOVERY_TYPES_TO_KEEP, CONSOLIDATED_RECOVERY_TYPE_DICT, CONSOLIDATED_RECOVERY_TYPES, CONSOLIDATED_RECOVERY_TYPE_DICT, ConsolidatedRecoveryTypes,
+    NORMALIZED_MACRO_CATEGORY_DICT, NORMALIZED_PRODUCT_TYPES_DICT,
+    LAG_WEEKS, ROLLING_WEEKS, ROLLING_WEEKS_LONG, EWMA_ALPHAS,
+    ContextKeys
+)
 from src.pipeline import Context, enforce
 from src.pipeline.types import PipelineStep
-from src.pipeline.conditions import Defines, Locks, Sequence
-from src.util import load, normalize_to_column_name
+from src.pipeline.conditions import Defines, Deletes, Locks, Sequence
+from src.util import load_dataframe, write_dataframe
 
 
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# PIPELINE STEP CONFIG/CONSTANTS
-# ============================================================
-# TODO: eventually will want to centralize all constants like this in the config file
-
-RECOVERY_TYPES = {
-    **{
-        recovery_type: normalize_to_column_name(recovery_type)
-        for recovery_type in (
-            "Sales",
-            "Return to Vendor",
-            "Remove Return",
-            #"Warehouse Deals and G&R",  # non-standard name
-            "Donations",
-            "Bintool Donations",
-            "Liquidations",
-            "Bintool Remove Liquidate",
-            "Remove Liquidate",
-            #"Bintool Theft",  # dropped — not modelled
-            #"C-Returns"  # we drop this type
-        )
-    },
-    "Warehouse Deals and G&R": "warehouse_deals_and_gr"
-}
-
-# Maps consolidated channel name → raw units_* columns that roll up into it.
-# Output column is always units_{name}. When the output name matches a source
-# (donations case) the source is overwritten with the combined sum.
-_CHANNEL_CONSOLIDATION: dict[str, list[str]] = {
-    "disposal": [                        # anything with "remove" in the recovery-type name
-        "units_remove_return",
-        "units_bintool_remove_liquidate",
-        "units_remove_liquidate",
-    ],
-    "donations": [                       # anything with "donations" in the recovery-type name
-        "units_donations",
-        "units_bintool_donations",
-    ],
-}
-
-MACRO_CATEGORIES = {
-    category: normalize_to_column_name(category)
-    for category in ("RETAIL", "FBA")
-}
-
-PRODUCT_TYPES = {
-    product_type: normalize_to_column_name(product_type)
-    for product_type in ("Food", "Non Food", "Pet Food")
-}
 
 
 # ============================================================
@@ -73,7 +30,8 @@ PRODUCT_TYPES = {
 # ============================================================
 
 @enforce({
-    # ContextKeys.DF_RECOVERY_LOADED: Requires,  # not needed if loading saved preprocessed data
+    # ContextKeys.DF_RECOVERY_LOADED: Requires(),           # not needed if loading from saved preprocessed data
+    ContextKeys.DF_RECOVERY_LOADED: Deletes(strict=False),  # delete if exists to free up memory
     ContextKeys.DF_RECOVERY_PREPROCESSED: Sequence(Defines(strict=True), Locks(strict=True))
 })
 class Preprocess(PipelineStep):
@@ -83,14 +41,20 @@ class Preprocess(PipelineStep):
     preprocessed data to an output parquet file.
     """
 
-    def __init__(self, read_from: str | None = None, write_to: str | None = None):
+    def __init__(
+            self,
+            read_from: str | PathLike[str] | None = None,  # 
+            save_to: str | PathLike[str] | None = None
+        ):
+        if read_from is not None and save_to is not None:
+            logger.warning(f"both reading and writing preprocessed data (is this intentional?): '{read_from}' -> '{save_to}'")
         self.read_from = read_from
-        self.write_to = write_to
+        self.save_to = save_to
     
     def __call__(self, context: Context) -> Context:
         if self.read_from is not None:  # read saved preprocessed data if provided
-            logger.info(f"loading preprocessed data from {self.read_from}")
-            df_recovery = load(self.read_from, CSV_DELIMITER)
+            logger.info(f"loading preprocessed data from '{self.read_from}'")
+            df_recovery = load_dataframe(self.read_from)
         else:  # otherwise process the raw data from the Load step
             logger.info("preprocessing data from Load step")
             df_recovery = (
@@ -103,7 +67,6 @@ class Preprocess(PipelineStep):
                         RecoverySchema.WEEK, RecoverySchema.GL_PRODUCT_GROUP
                     ]
                 )
-                .pipe(_consolidate_channels)            # merge sub-channels per _CHANNEL_CONSOLIDATION
                 .pipe(_unit_distribution_features)      # X% of units are Y
                 .pipe(_recovery_distribution_features)  # X% of recovered units are recovery_type Y
                 .pipe(_iso_week)
@@ -114,21 +77,24 @@ class Preprocess(PipelineStep):
                     _gl_share_features,
                 )
                 .pipe(_other_non_temporal_features)
-                .pipe(_round_decimal_columns, decimals=6)
+                .pipe(_round_decimal_columns, decimals=6)  # TODO: is this necessary to keep?
                 .pipe(
                     _temporal_features,
                     groupby = [RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP],
-                    lag_weeks = [1, 4, 12, 13, 52],  # ! don't change these parameters without changing
-                    rolling_weeks = [4, 12],         #   hard-coded feature names in subsequent steps
-                    rolling_weeks_long = [26, 52],
-                    ewma_alphas = [0.5, 0.1] 
+                    lag_weeks = LAG_WEEKS,
+                    rolling_weeks = ROLLING_WEEKS,
+                    rolling_weeks_long = ROLLING_WEEKS_LONG,
+                    ewma_alphas = EWMA_ALPHAS
                 )
+                .pipe(_post_cleaning)
             )
-
-        # save preprocessed data to output file if provided
-        if self.write_to is not None and self.write_to != self.read_from:  # WARNING: string equality != path equality (can't use pathlib w/ S3 paths)
-            logger.info(f"writing preprocessed data to {self.write_to}")
-            df_recovery.write_parquet(self.write_to)
+        
+        if ContextKeys.DF_RECOVERY_LOADED in context:  # clean up raw loaded data if exists
+            del context[ContextKeys.DF_RECOVERY_LOADED]
+        
+        if self.save_to is not None and self.save_to != self.read_from:  # write preprocessed data (note that the equality check doesn't fully check path equality)
+            logger.info(f"saving preprocessed data to '{self.save_to}'")
+            write_dataframe(df_recovery)
         
         context[ContextKeys.DF_RECOVERY_PREPROCESSED] = df_recovery
         context.lock(ContextKeys.DF_RECOVERY_PREPROCESSED)
@@ -143,7 +109,8 @@ class Preprocess(PipelineStep):
 def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
     # drop columns with all null values
     all_null_columns = (
-        df.select(pl.all().is_null().all())
+        df
+        .select(pl.all().is_null().all())
         .unpivot()
         .filter(pl.col("value") == True)
         .select("variable")
@@ -152,8 +119,13 @@ def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
     )
     df = df.drop(all_null_columns)
 
-    # filter out C-Returns
-    df = df.filter(pl.col(RecoverySchema.RECOVERY_TYPE) != "C-Returns")
+    # filter out C-Returns and Bintools Theft
+    df = df.filter(pl.col(RecoverySchema.RECOVERY_TYPE).isin(RECOVERY_TYPES_TO_KEEP))
+
+    # consolidate recovery types
+    df = df.with_columns(
+        pl.col(RecoverySchema.RECOVERY_TYPE).replace(CONSOLIDATED_RECOVERY_TYPE_DICT)
+    )
 
     # drop marketplace_id
     df = df.drop([RecoverySchema.MARKETPLACE_ID])  # marketplace_id redundant (same as country)
@@ -167,8 +139,10 @@ def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
 
     # create target variable
     df = df.with_columns(
-        pl.when(pl.col(RecoverySchema.RECOVERY_TYPE) == "Sales").then(pl.lit(0))
-        .otherwise(pl.lit(1)).alias("recovery")
+        pl.when(pl.col(RecoverySchema.RECOVERY_TYPE) == RecoveryTypes.SALES)
+        .then(pl.lit(0))
+        .otherwise(pl.lit(1))
+        .alias("recovery")
     )
 
     # reorder/select
@@ -222,28 +196,28 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
             ],
 
             # unit counts
-            *_conditional_sums(  # units_RETAIL, units_FBA
+            *_conditional_sums(  # units_retail, units_fba
                 filter_col=RecoverySchema.MACRO_CATEGORY,
-                filter_value_to_str=MACRO_CATEGORIES,
+                filter_value_to_str=NORMALIZED_MACRO_CATEGORY_DICT,
                 sum_col=RecoverySchema.UNITS,
                 alias_prefix="units"
             ).values(),
             *_conditional_sums(  # units_food, units_non_food, units_pet_food
                 filter_col=RecoverySchema.PRODUCT_TYPE,
-                filter_value_to_str=PRODUCT_TYPES,
+                filter_value_to_str=NORMALIZED_PRODUCT_TYPES_DICT,
                 sum_col=RecoverySchema.UNITS,
                 alias_prefix="units"
             ).values(),
             _conditional_sum(  # units_recovered (i.e., units not sold)
                 filter_col=RecoverySchema.RECOVERY_TYPE,
-                filter_value="Sales",
+                filter_value=RecoveryTypes.SALES,
                 sum_col="units",
                 alias="units_recovered",
                 comparator=ne
             ),
             *_conditional_sums(  # units_sales, units_return_to_vendor, ...
                 filter_col=RecoverySchema.RECOVERY_TYPE,
-                filter_value_to_str=RECOVERY_TYPES,
+                filter_value_to_str=CONSOLIDATED_RECOVERY_TYPE_DICT,
                 sum_col=RecoverySchema.UNITS,
                 alias_prefix="units"
             ).values(),
@@ -251,58 +225,40 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
         ])
     )
 
-def _consolidate_channels(df: pl.DataFrame) -> pl.DataFrame:
-    """Sum raw sub-channel unit columns into consolidated channel columns."""
-    new_cols = [
-        pl.sum_horizontal([pl.col(c) for c in srcs]).alias(f"units_{name}")
-        for name, srcs in _CHANNEL_CONSOLIDATION.items()
-    ]
-    to_drop = [
-        c
-        for name, srcs in _CHANNEL_CONSOLIDATION.items()
-        for c in srcs
-        if c != f"units_{name}"
-    ]
-    return df.with_columns(new_cols).drop(to_drop)
-
-
 def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
-        # macro category
-        _safe_division("units_RETAIL", "units_total", "share_RETAIL"),
-        _safe_division("units_FBA", "units_total", "share_FBA"),
-
-        # hazmat
-        _safe_division("units_hazmat", "units_total", "share_hazmat"),
-
-        # product type
-        _safe_division("units_food", "units_total", "share_food"),
-        _safe_division("units_non_food", "units_total", "share_non_food"),
-        _safe_division("units_pet_food", "units_total", "share_pet_food"),
+        # macro category: share_retail, share_fba
+        # product type: share_food, share_non_food, share_pet_food
+        # hazmat: share_hazmat
+        *[
+            _safe_division(f"units_{c}", "units_total", f"share_{c}")
+            for c in list(NORMALIZED_MACRO_CATEGORY_DICT.values()) +
+                     list(NORMALIZED_PRODUCT_TYPES_DICT.values) +
+                     ["hazmat"]
+        ],
 
         # recovered units
-        _safe_division("units_sales", "units_total", "prob_sales"),                                        # P(Sales)
-        _safe_division("units_recovered", "units_total", "prob_recovered"),                                # P(~Sales) = 1-P(Sales) = SUM of below
-        _safe_division("units_return_to_vendor", "units_total", "prob_return_to_vendor"),       # P(Return to Vendor)
-        _safe_division("units_warehouse_deals_and_gr", "units_total", "prob_warehouse_deals_and_gr"),  # P(Warehouse Deals and G&R)
-        _safe_division("units_donations", "units_total", "prob_donations"),                    # P(Donations) — includes bintool_donations
-        _safe_division("units_liquidations", "units_total", "prob_liquidations"),              # P(Liquidations)
-        _safe_division("units_disposal", "units_total", "prob_disposal"),                      # P(Disposal) — remove_return + bintool_remove_liquidate + remove_liquidate
+        *[  # prob_sales, prob_return_to_vendor, prob_warehouse_deals_and_g&r, prob_liquidations, prob_donations, prob_disposal
+            _safe_division(f"units_{consolidated_recovery_type}", "units_total", f"prob_{consolidated_recovery_type}")
+            for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
+        ],
+        _safe_division("units_recovered", "units_total", "prob_recovered"),
     ])
 
 def _recovery_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
-        _safe_division("units_sales", "units_recovered", "share_sales"),                                        # |Sales|/|~Sales|
-        _safe_division("units_return_to_vendor", "units_recovered", "share_return_to_vendor"),      # P(Return to Vendor | ~Sale)
-        _safe_division("units_warehouse_deals_and_gr", "units_recovered", "share_warehouse_deals_and_gr"),  # P(Warehouse Deals and G&R | ~Sale)
-        _safe_division("units_donations", "units_recovered", "share_donations"),                   # P(Donations | ~Sale) — includes bintool_donations
-        _safe_division("units_liquidations", "units_recovered", "share_liquidations"),             # P(Liquidations | ~Sale)
-        _safe_division("units_disposal", "units_recovered", "share_disposal"),                     # P(Disposal | ~Sale) — remove_return + bintool_remove_liquidate + remove_liquidate
+        _safe_division("units_sales", "units_recovered", "share_sales"),  # |Sales|/|~Sales|
+        *[  # share_return_to_vendor, share_warehouse_deals_and_g, share_donations, share_liquidations, share_disposal
+            # (e.g., share_return_to_vendor = P(Return to Vendor | ~Sale))
+            _safe_division(f"units_{consolidated_recovery_type}", "units_recovered", f"share_{consolidated_recovery_type}")
+            for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
+            if consolidated_recovery_type != ConsolidatedRecoveryTypes.SALES
+        ]
     ])
 
 def _iso_week(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(
-        pl.date(pl.col(RecoverySchema.YEAR), 1, 4)
+        pl.date(pl.col(RecoverySchema.YEAR), 1, 4)  # TODO: what is this?
         .dt.truncate("1w")
         .dt.offset_by(
             (pl.col(RecoverySchema.WEEK).cast(pl.Int32) - 1).cast(pl.Utf8) + "w"
@@ -312,17 +268,13 @@ def _iso_week(df: pl.DataFrame) -> pl.DataFrame:
 
 def _site_week_features(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
     return df.with_columns([
-        pl.sum("units_total").over(groupby).alias("site_units_total_week"),
-        pl.sum("weight_total").over(groupby).alias("site_weight_total_week"),
-        pl.sum("units_recovered").over(groupby).alias("site_units_recovered_week"),
-
-        # Recovery type site totals (consolidated channels)
-        pl.sum("units_donations").over(groupby).alias("site_units_donations_week"),
-        pl.sum("units_disposal").over(groupby).alias("site_units_disposal_week"),
-        pl.sum("units_warehouse_deals_and_gr").over(groupby).alias("site_units_warehouse_deals_and_gr_week"),
-        pl.sum("units_liquidations").over(groupby).alias("site_units_liquidations_week"),
-        pl.sum("units_sales").over(groupby).alias("site_units_sales_week"),
-        pl.sum("units_return_to_vendor").over(groupby).alias("site_units_return_to_vendor_week"),
+        *[
+            pl.sum(col).over(groupby).alias(f"site_{col}_week")
+            for col in ["units_total", "weight_total", "units_recovered"] + [
+                f"units_{consolidated_recovery_type}"
+                for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
+            ]
+        ]
     ])
 
 def _gl_share_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -335,12 +287,12 @@ def _gl_share_features(df: pl.DataFrame) -> pl.DataFrame:
         (pl.col("site_units_recovered_week") / pl.col("site_units_total_week")).alias("site_prob_recovered_week"),
 
         # Per consolidated channel probability at site level
-        (pl.col("site_units_donations_week") / pl.col("site_units_total_week")).alias("site_prob_donations_week"),
-        (pl.col("site_units_disposal_week") / pl.col("site_units_total_week")).alias("site_prob_disposal_week"),
-        (pl.col("site_units_warehouse_deals_and_gr_week") / pl.col("site_units_total_week")).alias("site_prob_warehouse_deals_and_gr_week"),
-        (pl.col("site_units_liquidations_week") / pl.col("site_units_total_week")).alias("site_prob_liquidations_week"),
-        (pl.col("site_units_sales_week") / pl.col("site_units_total_week")).alias("site_prob_sales_week"),
-        (pl.col("site_units_return_to_vendor_week") / pl.col("site_units_total_week")).alias("site_prob_return_to_vendor_week"),
+        *[
+            (
+                pl.col(f"site_units_{consolidated_recovery_type}_week") / pl.col("site_units_total_week")
+            ).alias(f"site_prob_{consolidated_recovery_type}_week")
+            for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
+        ]
     ])
 
 def _other_non_temporal_features(df: pl.DataFrame) -> pl.DataFrame:
@@ -417,7 +369,7 @@ def _temporal_features(
 
     # == EWMA (fast: alpha=0.5, slow: alpha=0.1) ==
     ewma_exprs = [
-        pl.col(col).shift(1).ewm_mean(alpha=alpha, min_periods=4).over(groupby).alias(f"{col}_ewma_{str(alpha).replace('0.', '')}a")
+        pl.col(col).shift(1).ewm_mean(alpha=alpha, min_periods=4).over(groupby).alias(f"{col}_ewma_{alpha}")
         for col in feature_cols
         for alpha in ewma_alphas
     ]
@@ -441,6 +393,10 @@ def _temporal_features(
     )
 
     return df_full_weeks
+
+def _post_cleaning(df: pl.DataFrame) -> pl.DataFrame:
+    # TODO: select only the features used in the models
+    ...
 
 
 def _conditional_sum(

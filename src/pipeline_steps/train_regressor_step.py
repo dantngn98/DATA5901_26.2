@@ -1,10 +1,7 @@
 # standard
 import logging
-import tempfile
 
 # third-party
-import boto3
-import joblib
 import numpy as np
 import optuna
 import polars as pl
@@ -13,15 +10,15 @@ from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
 # local
-from src.config import ContextKeys, REG_MODEL_S3_KEY, S3_BUCKET, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS
+from src.config import (
+    CATEGORICAL_COLUMNS,
+    RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_REG_DEFAULT_PARAMS,
+    ContextKeys
+)
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
-from src.util import load
-from src.pipeline_steps.train_binary_classifier_step import (
-    _FEATURE_COLS,
-    _cast_categoricals,
-)
+from src.util import cast_categoricals, load_joblib_from_s3, write_joblib_to_s3, S3Path
 
 logger = logging.getLogger(__name__)
 
@@ -35,20 +32,88 @@ _BASELINE_COLS: list[str] = [
     "site_gl_n_nonzero_weeks",
 ]
 
-_EXTENDED_FEATURE_COLS: list[str] = _FEATURE_COLS + _BASELINE_COLS
+_EXTENDED_FEATURE_COLS: list[str] = RECOVERY_RATE_CLF_FEATURE_COLUMNS + _BASELINE_COLS
 
 _EPS = 1e-6
 
-_DEFAULT_REG_PARAMS: dict = {
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 5,
-    "gamma": 0.1,
-    "reg_alpha": 0.01,
-    "reg_lambda": 1.0,
-}
+# ============================================================
+# Pipeline step
+# ============================================================
+
+@enforce({
+    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from makes it optional
+    ContextKeys.REG_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
+})
+class TrainRegressor(PipelineStep):
+    """
+    Define the regression model for predicting recovery rates, either by loading a pre-trained model from S3 or 
+    by training a new XGBoost regressor on the training data output by the preprocessing step.
+    Operates on non-zero recovery rows only. Computes site - GL baseline features
+    from training data, persists them on the model object as `site_gl_baseline_` and
+    `baseline_priors_`, saves to S3, and
+    stores the model in context under ContextKeys.REG_MODEL.
+    """
+
+    def __init__(
+        self,
+        train_years,
+        test_years,
+        tune: bool = False,
+        n_trials: int = 50,
+        holdout_frac: float = 0.05,
+        holdout_seed: int = 42,
+        read_from: S3Path | None = None,
+        save_to: S3Path | None = None,
+    ):
+        self.train_years = train_years
+        self.test_years = test_years
+        self.tune = tune
+        self.n_trials = n_trials
+        self.holdout_frac = holdout_frac
+        self.holdout_seed = holdout_seed
+        self.read_from = read_from
+        self.save_to = save_to
+
+    def __call__(self, context: Context) -> Context:
+        if self.read_from_key is not None:
+            logger.info(f"loading regressor from '{self.read_from.uri}'")
+            model = load_joblib_from_s3(self.read_from)
+            logger.info(f"loaded {type(model)} object")
+            assert isinstance(model, XGBRegressor)
+        else:
+            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
+
+            X_train, X_val, y_train, y_val, site_gl_baseline, priors = _build_train_val_splits(
+                df,
+                train_years=self.train_years,
+                test_years=self.test_years,
+                holdout_frac=self.holdout_frac,
+                holdout_seed=self.holdout_seed,
+            )
+
+            if self.tune:
+                best_params = _tune_with_optuna(
+                    X_train, X_val, y_train, y_val,
+                    n_trials=self.n_trials,
+                )
+            else:
+                best_params = RECOVERY_RATE_REG_DEFAULT_PARAMS
+
+            model = _train_final_model(X_train, X_val, y_train, y_val, best_params)
+
+            # Persist baseline data on the model so downstream steps and evaluation
+            # notebooks can load it without re-reading training data.
+            model.site_gl_baseline_ = site_gl_baseline
+            model.baseline_priors_ = priors
+
+        if self.save_to is not None and self.save_to != self.read_from:
+            logger.info(f"saving binary classifier to '{self.save_to.uri}'")
+            write_joblib_to_s3(model, self.save_to)
+
+        context[ContextKeys.REG_MODEL] = model
+        context.lock(ContextKeys.REG_MODEL)
+
+        return context
 
 
 # ============================================================
@@ -220,8 +285,8 @@ def _build_train_val_splits(
     )
     df_val_nz = _fill_site_gl_baseline(df_val_nz, priors)
 
-    X_train = _cast_categoricals(df_train_nz.select(_EXTENDED_FEATURE_COLS).to_pandas())
-    X_val = _cast_categoricals(df_val_nz.select(_EXTENDED_FEATURE_COLS).to_pandas())
+    X_train = cast_categoricals(df_train_nz.select(_EXTENDED_FEATURE_COLS).to_pandas(), CATEGORICAL_COLUMNS)
+    X_val = cast_categoricals(df_val_nz.select(_EXTENDED_FEATURE_COLS).to_pandas(), CATEGORICAL_COLUMNS)
 
     y_train = df_train_nz[target_col].to_pandas().values
     y_val = df_val_nz[target_col].to_pandas().values
@@ -314,115 +379,3 @@ def _train_final_model(
     )
     logger.info("Stage 2 final model: best_iteration=%d", model.best_iteration)
     return model
-
-
-def _save_reg_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            joblib.dump(model, fp)
-            fp.seek(0)
-            s3_client.put_object(Body=fp.read(), Bucket=bucket, Key=key)
-            logger.info("Regressor saved to s3://%s/%s", bucket, key)
-    except Exception:
-        logger.exception("Failed to save regressor to s3://%s/%s", bucket, key)
-        raise
-
-def _load_reg_from_s3(bucket: str, key: str) -> XGBRegressor:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            s3_client.download_fileobj(bucket, key, fp)
-            fp.seek(0)
-
-            model = joblib.load(fp)
-
-            if not isinstance(model, XGBRegressor):
-                raise ValueError("Object loaded from s3://%s/%s is not an instance of XGBRegressor")
-
-            logger.info("Classifier loaded from s3://%s/%s", bucket, key)
-            return model
-
-    except Exception:
-        logger.exception(
-            "Failed to load classifier from s3://%s/%s",
-            bucket,
-            key,
-        )
-        raise
-
-
-# ============================================================
-# Pipeline step
-# ============================================================
-
-@enforce({
-    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from makes it optional
-    ContextKeys.REG_MODEL: Sequence(Defines(strict=True), Locks(strict=True)),
-})
-class TrainRegressor(PipelineStep):
-    """
-    Define the regression model for predicting recovery rates, either by loading a pre-trained model from S3 or 
-    by training a new XGBoost regressor on the training data output by the preprocessing step.
-    Operates on non-zero recovery rows only. Computes site - GL baseline features
-    from training data, persists them on the model object as `site_gl_baseline_` and
-    `baseline_priors_`, saves to S3, and
-    stores the model in context under ContextKeys.REG_MODEL.
-    """
-
-    def __init__(
-        self,
-        tune: bool = False,
-        n_trials: int = 50,
-        train_years: list[int] | None = None,
-        test_years: list[int] | None = None,
-        holdout_frac: float = 0.05,
-        holdout_seed: int = 42,
-        read_from_key: str | None = None,
-        save_to_key: str | None = None,
-    ):
-        self.tune = tune
-        self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
-        self.holdout_frac = holdout_frac
-        self.holdout_seed = holdout_seed
-        self.read_from_key = read_from_key
-        self.save_to_key = save_to_key
-
-    def __call__(self, context: Context) -> Context:
-        if self.read_from_key is not None:
-            model = _load_reg_from_s3(S3_BUCKET, self.read_from_key)
-        else:
-            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
-
-            X_train, X_val, y_train, y_val, site_gl_baseline, priors = _build_train_val_splits(
-                df,
-                train_years=self.train_years,
-                test_years=self.test_years,
-                holdout_frac=self.holdout_frac,
-                holdout_seed=self.holdout_seed,
-            )
-
-            if self.tune:
-                best_params = _tune_with_optuna(
-                    X_train, X_val, y_train, y_val,
-                    n_trials=self.n_trials,
-                )
-            else:
-                best_params = _DEFAULT_REG_PARAMS
-
-            model = _train_final_model(X_train, X_val, y_train, y_val, best_params)
-
-            # Persist baseline data on the model so downstream steps and evaluation
-            # notebooks can load it without re-reading training data.
-            model.site_gl_baseline_ = site_gl_baseline  # TODO: write these as context variables (unless it's important for it to be stored w/ model params)
-            model.baseline_priors_ = priors
-
-        if self.save_to_key is not None:
-            _save_reg_to_s3(model, S3_BUCKET, self.save_to_key)
-
-        context[ContextKeys.REG_MODEL] = model
-        context.lock(ContextKeys.REG_MODEL)
-
-        return context
