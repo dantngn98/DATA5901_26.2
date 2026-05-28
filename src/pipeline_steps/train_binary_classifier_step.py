@@ -12,6 +12,7 @@ from xgboost import XGBClassifier
 
 # local
 from src.config import (
+    RecoverySchema,
     CATEGORICAL_COLUMNS,
     RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_TARGET_COLUMN, RECOVERY_RATE_CLF_DEFAULT_PARAMS, 
     ContextKeys
@@ -51,20 +52,23 @@ class TrainBinaryClassifier(PipelineStep):
         test_years: list[int],
         tune: bool = False,
         n_trials: int = 50,
-        read_from: S3Path | None = None,
+        load_from: S3Path | None = None,
         save_to: S3Path | None = None,
     ):
+        if load_from is not None and save_to is not None:
+            logger.warning(f"both loading and saving model (is this intentional?): '{load_from}' -> '{save_to}'")
+        
         self.train_years = train_years
         self.test_years = test_years
         self.tune = tune
         self.n_trials = n_trials
-        self.read_from = read_from
+        self.load_from = load_from
         self.save_to = save_to
 
     def __call__(self, context: Context) -> Context:
-        if self.read_from_key is not None:
-            logger.info(f"loading binary classifier from '{self.read_from.uri}'")
-            model = load_joblib_from_s3(self.read_from)
+        if self.load_from is not None:
+            logger.info(f"loading recovery binary classifier from '{self.load_from.uri}'")
+            model = load_joblib_from_s3(self.load_from)
             logger.info(f"loaded {type(model)} object")
             assert isinstance(model, XGBClassifier)
         else:
@@ -89,8 +93,8 @@ class TrainBinaryClassifier(PipelineStep):
                 best_params=best_params,
             )
 
-        if self.save_to is not None and self.save_to != self.read_from:
-            logger.info(f"saving binary classifier to '{self.save_to.uri}'")
+        if self.save_to is not None:
+            logger.info(f"saving recovery binary classifier to '{self.save_to.uri}'")
             write_joblib_to_s3(model, self.save_to)
 
         context[ContextKeys.CLF_MODEL] = model
@@ -108,8 +112,8 @@ def _build_train_val_splits(
     train_years: list[int],
     test_years: list[int],
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, float]:
-    df_train = df.filter(pl.col("year").is_in(train_years))
-    df_val = df.filter(pl.col("year").is_in(test_years))
+    df_train = df.filter(pl.col(RecoverySchema.YEAR).is_in(train_years))
+    df_val = df.filter(pl.col(RecoverySchema.YEAR).is_in(test_years))
 
     feature_columns = tuple(RECOVERY_RATE_CLF_FEATURE_COLUMNS)
     X_train = cast_categoricals(df_train.select(feature_columns).to_pandas(), CATEGORICAL_COLUMNS)

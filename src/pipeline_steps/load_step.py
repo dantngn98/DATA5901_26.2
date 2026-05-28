@@ -1,5 +1,6 @@
 # standard
 import logging
+from os import PathLike
 from typing import Iterable
 
 # local
@@ -22,7 +23,7 @@ class Load(PipelineStep):
     the resultant dataframes together.
     """
 
-    def __init__(self, recovery_data_source: (str | S3Path) | Iterable[str | S3Path]):
+    def __init__(self, recovery_data_source: (str | PathLike[str]) | Iterable[str | PathLike[str]]):
         self.recovery_data_source = recovery_data_source
 
     def __call__(self, context: Context) -> Context:

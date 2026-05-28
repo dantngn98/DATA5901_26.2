@@ -12,20 +12,21 @@ import numpy as np
 import pandas as pd
 
 # local
-from src.config import ContextKeys, REPORT_S3_KEY, S3_BUCKET
+from src.config import ContextKeys, ConsolidatedRecoveryTypes, RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES, RecoverySchema
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Requires, Sequence
 from src.pipeline.types import PipelineStep
-from src.pipeline_steps.train_per_channel_share_step import RECOVERY_CHANNELS
+from src.util import S3Path
+
 
 logger = logging.getLogger(__name__)
 
 _CHANNEL_LABELS: dict[str, str] = {
-    "prob_donations":               "Donations",
-    "prob_liquidations":            "Liquidations",
-    "prob_return_to_vendor":        "Return to Vendor",
-    "prob_warehouse_deals_and_gr":  "Warehouse Deals / GR",
-    "prob_disposal":                "Disposal",
+    ConsolidatedRecoveryTypes.DONATIONS:               "Donations",
+    ConsolidatedRecoveryTypes.LIQUIDATIONS:            "Liquidations",
+    ConsolidatedRecoveryTypes.RETURN_TO_VENDOR:        "Return to Vendor",
+    ConsolidatedRecoveryTypes.WAREHOUSE_DEALS_AND_GR:  "Warehouse Deals / GR",
+    ConsolidatedRecoveryTypes.DISPOSAL:                "Disposal",
 }
 
 _RATE_BUCKET_ORDER   = ["zero", "0-10%", "10-30%", "30-60%", ">60%"]
@@ -37,63 +38,47 @@ _THUMB_DPI  = 160
 
 
 # ============================================================
-# Utility helpers
+# Pipeline step
 # ============================================================
 
-def _fig_to_b64(fig: plt.Figure) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=_THUMB_DPI)
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
+@enforce({
+    ContextKeys.PREDICTIONS: Requires(),
+    ContextKeys.REPORT: Sequence(Defines(strict=True), Locks(strict=True)),
+})
+class Report(PipelineStep):
+    """Reads ContextKeys.PREDICTIONS and produces a self-contained HTML report.
 
+    Sections:
+      1. Model performance summary (overall MAE, MAE by rate/volume bucket)
+      2. Highest-risk GL groups and sites by mean predicted recovery rate (high rate = bad outcome)
+      3. Individual trend charts per GL and per site for overall rate + each recovery channel;
+         groups with 100% actual recovery are listed and excluded from charts
+      4. SHAP baseline-vs-deviation attribution for highest-risk sites (skipped when SHAP not run)
 
-def _img_tag(b64: str, style: str = "max-width:100%;") -> str:
-    return f'<img src="data:image/png;base64,{b64}" style="{style}"/>'
+    The HTML string is stored in ContextKeys.REPORT and optionally uploaded to S3.
+    """
 
+    def __init__(
+        self,
+        top_n: int = 10,
+        save_to: S3Path | None = None,
+    ):
+        self.top_n = top_n
+        self.save_to = save_to
 
-def _df_to_html_table(df: pd.DataFrame, float_fmt: str = ".4f") -> str:
-    rows = ["<table>", "<thead><tr>"]
-    for col in df.columns:
-        rows.append(f"<th>{col}</th>")
-    rows.append("</tr></thead><tbody>")
-    for _, row in df.iterrows():
-        rows.append("<tr>")
-        for col in df.columns:
-            val = row[col]
-            if isinstance(val, float):
-                cell = f"{val:{float_fmt}}"
-                if "mae" in col.lower():
-                    if val < 0.05:
-                        style = "background:#d4edda;"
-                    elif val < 0.10:
-                        style = "background:#fff3cd;"
-                    else:
-                        style = "background:#f8d7da;"
-                    rows.append(f'<td style="{style}">{cell}</td>')
-                    continue
-            else:
-                cell = str(val)
-            rows.append(f"<td>{cell}</td>")
-        rows.append("</tr>")
-    rows.append("</tbody></table>")
-    return "\n".join(rows)
+    def __call__(self, context: Context) -> Context:
+        df = context[ContextKeys.PREDICTIONS].to_pandas()
+        logger.info("Building report from %d prediction rows", len(df))
 
+        html = _build_report(df, self.top_n)
 
-def _render_individual_charts(charts: list[tuple[str, str]]) -> str:
-    """Render a list of (label, base64_png) pairs in a 2-column grid."""
-    items = "".join(
-        f'<figure style="margin:0;">'
-        f'<img src="data:image/png;base64,{b64}"'
-        f' style="width:100%;display:block;border:1px solid #ddd;border-radius:4px;"/>'
-        f'<figcaption style="font-size:.75rem;text-align:center;color:#555;padding:.2rem 0;">'
-        f'{label}</figcaption></figure>'
-        for label, b64 in charts
-    )
-    return (
-        '<div style="display:grid;grid-template-columns:repeat(2,1fr);'
-        f'gap:.75rem;margin-bottom:1.5rem;">{items}</div>'
-    )
+        if self.save_to is not None:
+            _save_html_to_s3(html, self.save_to.uri)
+
+        context[ContextKeys.REPORT] = html
+        context.lock(ContextKeys.REPORT)
+
+        return context
 
 
 # ============================================================
@@ -161,8 +146,8 @@ def _top_n_by_rate(df: pd.DataFrame, group_col: str, n: int) -> pd.DataFrame:
 
 
 def _render_performers_section(df: pd.DataFrame, top_n: int) -> str:
-    gl_tbl   = _top_n_by_rate(df, "gl_product_group", top_n)
-    site_tbl = _top_n_by_rate(df, "hashed_fc", top_n)
+    gl_tbl   = _top_n_by_rate(df, RecoverySchema.GL_PRODUCT_GROUP, top_n)
+    site_tbl = _top_n_by_rate(df, RecoverySchema.HASHED_FC, top_n)
     html = [
         "<section>",
         "<h2>Highest-Risk Groups (Elevated Recovery Rate)</h2>",
@@ -260,10 +245,10 @@ def _render_trend_section(df: pd.DataFrame, top_n: int) -> str:
     has_gt = "prob_recovered" in df.columns
 
     # Identify and exclude always-full-recovery groups
-    gl_full   = _find_always_full_recovery(df, "gl_product_group")
-    site_full = _find_always_full_recovery(df, "hashed_fc")
+    gl_full   = _find_always_full_recovery(df, RecoverySchema.GL_PRODUCT_GROUP)
+    site_full = _find_always_full_recovery(df, RecoverySchema.HASHED_FC)
     df_plot   = df[
-        ~df["gl_product_group"].isin(gl_full) & ~df["hashed_fc"].isin(site_full)
+        ~df[RecoverySchema.GL_PRODUCT_GROUP].isin(gl_full) & ~df[RecoverySchema.HASHED_FC].isin(site_full)
     ].copy() if (gl_full or site_full) else df
 
     html = ["<section>", "<h2>Recovery Rate Trend over Week</h2>"]
@@ -277,16 +262,16 @@ def _render_trend_section(df: pd.DataFrame, top_n: int) -> str:
 
     html.append(f"<h3>Overall — Top {top_n} GL Product Groups</h3>")
     html.append(_render_individual_charts(
-        _charts_weekly_individual(df_plot, "gl_product_group", top_n, "combined_rate", actual_overall)
+        _charts_weekly_individual(df_plot, RecoverySchema.GL_PRODUCT_GROUP, top_n, "combined_rate", actual_overall)
     ))
 
     html.append(f"<h3>Overall — Top {top_n} Sites</h3>")
     html.append(_render_individual_charts(
-        _charts_weekly_individual(df_plot, "hashed_fc", top_n, "combined_rate", actual_overall)
+        _charts_weekly_individual(df_plot, RecoverySchema.HASHED_FC, top_n, "combined_rate", actual_overall)
     ))
 
     # --- Per-channel breakdown ---
-    for channel in RECOVERY_CHANNELS:
+    for channel in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES:
         pred_col   = f"pred_{channel}"
         actual_col = channel if (has_gt and channel in df_plot.columns) else None
         if pred_col not in df_plot.columns:
@@ -295,12 +280,12 @@ def _render_trend_section(df: pd.DataFrame, top_n: int) -> str:
 
         html.append(f"<h3>{label} — Top {top_n} GL Product Groups</h3>")
         html.append(_render_individual_charts(
-            _charts_weekly_individual(df_plot, "gl_product_group", top_n, pred_col, actual_col)
+            _charts_weekly_individual(df_plot, RecoverySchema.GL_PRODUCT_GROUP, top_n, pred_col, actual_col)
         ))
 
         html.append(f"<h3>{label} — Top {top_n} Sites</h3>")
         html.append(_render_individual_charts(
-            _charts_weekly_individual(df_plot, "hashed_fc", top_n, pred_col, actual_col)
+            _charts_weekly_individual(df_plot, RecoverySchema.HASHED_FC, top_n, pred_col, actual_col)
         ))
 
     html.append("</section>")
@@ -320,7 +305,7 @@ def _shap_available(df: pd.DataFrame) -> bool:
 
 def _chart_shap_attribution(df: pd.DataFrame, top_n: int = 5) -> str:
     site_shap = (
-        df.groupby("hashed_fc")
+        df.groupby(RecoverySchema.HASHED_FC)
         .agg(
             mean_rate=("combined_rate", "mean"),
             baseline=("shap_baseline_rate", "mean"),
@@ -337,7 +322,7 @@ def _chart_shap_attribution(df: pd.DataFrame, top_n: int = 5) -> str:
     ax.bar(x, site_shap["deviation"], bottom=site_shap["baseline"],
            label="Deviation contribution", color="#dd8452")
     ax.set_xticks(x)
-    ax.set_xticklabels(site_shap["hashed_fc"], rotation=30, ha="right", fontsize=8)
+    ax.set_xticklabels(site_shap[RecoverySchema.HASHED_FC], rotation=30, ha="right", fontsize=8)
     ax.set_ylabel("Recovery rate (SHAP decomposition)")
     ax.set_title(f"Top {top_n} Highest-Risk Sites — SHAP Baseline vs Deviation")
     ax.legend()
@@ -353,7 +338,7 @@ def _render_shap_section(df: pd.DataFrame, top_n: int) -> str:
     b64 = _chart_shap_attribution(df, min(top_n, 5))
 
     site_dev = (
-        df.groupby("hashed_fc")["shap_deviation_contribution"].mean()
+        df.groupby(RecoverySchema.HASHED_FC)["shap_deviation_contribution"].mean()
         .sort_values(ascending=False)
     )
     best_site = site_dev.index[0]
@@ -439,44 +424,60 @@ def _save_html_to_s3(html: str, s3_uri: str) -> None:
 
 
 # ============================================================
-# Pipeline step
+# Utility helpers
 # ============================================================
 
-@enforce({
-    ContextKeys.PREDICTIONS: Requires(),
-    ContextKeys.REPORT: Sequence(Defines(strict=True), Locks(strict=True)),
-})
-class Report(PipelineStep):
-    """Reads ContextKeys.PREDICTIONS and produces a self-contained HTML report.
+def _fig_to_b64(fig: plt.Figure) -> str:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=_THUMB_DPI)
+    plt.close(fig)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("ascii")
 
-    Sections:
-      1. Model performance summary (overall MAE, MAE by rate/volume bucket)
-      2. Highest-risk GL groups and sites by mean predicted recovery rate (high rate = bad outcome)
-      3. Individual trend charts per GL and per site for overall rate + each recovery channel;
-         groups with 100% actual recovery are listed and excluded from charts
-      4. SHAP baseline-vs-deviation attribution for highest-risk sites (skipped when SHAP not run)
 
-    The HTML string is stored in ContextKeys.REPORT and optionally uploaded to S3.
-    """
+def _img_tag(b64: str, style: str = "max-width:100%;") -> str:
+    return f'<img src="data:image/png;base64,{b64}" style="{style}"/>'
 
-    def __init__(
-        self,
-        top_n: int = 10,
-        save_to: str | None = None,
-    ):
-        self.top_n = top_n
-        self.save_to = save_to
 
-    def __call__(self, context: Context) -> Context:
-        df = context[ContextKeys.PREDICTIONS].to_pandas()
-        logger.info("Building report from %d prediction rows", len(df))
+def _df_to_html_table(df: pd.DataFrame, float_fmt: str = ".4f") -> str:
+    rows = ["<table>", "<thead><tr>"]
+    for col in df.columns:
+        rows.append(f"<th>{col}</th>")
+    rows.append("</tr></thead><tbody>")
+    for _, row in df.iterrows():
+        rows.append("<tr>")
+        for col in df.columns:
+            val = row[col]
+            if isinstance(val, float):
+                cell = f"{val:{float_fmt}}"
+                if "mae" in col.lower():
+                    if val < 0.05:
+                        style = "background:#d4edda;"
+                    elif val < 0.10:
+                        style = "background:#fff3cd;"
+                    else:
+                        style = "background:#f8d7da;"
+                    rows.append(f'<td style="{style}">{cell}</td>')
+                    continue
+            else:
+                cell = str(val)
+            rows.append(f"<td>{cell}</td>")
+        rows.append("</tr>")
+    rows.append("</tbody></table>")
+    return "\n".join(rows)
 
-        html = _build_report(df, self.top_n)
 
-        if self.save_to is not None:
-            _save_html_to_s3(html, self.save_to)
-
-        context[ContextKeys.REPORT] = html
-        context.lock(ContextKeys.REPORT)
-
-        return context
+def _render_individual_charts(charts: list[tuple[str, str]]) -> str:
+    """Render a list of (label, base64_png) pairs in a 2-column grid."""
+    items = "".join(
+        f'<figure style="margin:0;">'
+        f'<img src="data:image/png;base64,{b64}"'
+        f' style="width:100%;display:block;border:1px solid #ddd;border-radius:4px;"/>'
+        f'<figcaption style="font-size:.75rem;text-align:center;color:#555;padding:.2rem 0;">'
+        f'{label}</figcaption></figure>'
+        for label, b64 in charts
+    )
+    return (
+        '<div style="display:grid;grid-template-columns:repeat(2,1fr);'
+        f'gap:.75rem;margin-bottom:1.5rem;">{items}</div>'
+    )

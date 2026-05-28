@@ -83,7 +83,7 @@ RECOVERY_TYPES = {
     for attr in dir(RecoveryTypes)
     if not (attr.startswith("__") and attr.endswith("__"))
 }
-MACRO_CATEGORIES = {"RETAIL", "FBA"}  # TODO: make these dynamic? (would require eager evaluation)
+MACRO_CATEGORIES = {"RETAIL", "FBA"}  # TODO: make these dynamic? (would require eager evaluation during preprocessing)
 PRODUCT_TYPES = {"Food", "Non Food", "Pet Food"}
 
 
@@ -122,6 +122,11 @@ CONSOLIDATED_RECOVERY_TYPES = {
     getattr(ConsolidatedRecoveryTypes, attr)
     for attr in dir(ConsolidatedRecoveryTypes)
     if not (attr.startswith("__") and attr.endswith("__"))
+}
+RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES = {
+    consolidated_recovery_type
+    for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
+    if consolidated_recovery_type != ConsolidatedRecoveryTypes.SALES
 }
 CONSOLIDATED_RECOVERY_TYPE_DICT = {  # recovery type -> consolidated recovery type
     RecoveryTypes.SALES: ConsolidatedRecoveryTypes.SALES,
@@ -200,16 +205,16 @@ _TEMPORAL_COMPOSITION_COLS = {
     *[f"share_{c}_rolling_{w}w" for c in _COMPOSITION_COLUMNS for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG],
     *[f"share_{c}_ewma_{a}"for c in _COMPOSITION_COLUMNS for a in EWMA_ALPHAS]
 }
-_TEMPORAL_VOLUME_COLS = {
+_TEMPORAL_VOLUME_COLUMNS = {
     *[f"{v}_lag_{w}w" for v in ["units_total", "cogs_total", "weight_total"] for w in LAG_WEEKS],
     *[f"{v}_rolling_{w}w" for v in ["units_total", "cogs_total", "weight_total"] for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG],
     *[f"{v}_ewma_{a}" for v in ["units_total", "cogs_total", "weight_total"] for a in EWMA_ALPHAS]
 }
-_TEMPORAL_PROBABILITY_COLS: list[str] = (
+_TEMPORAL_PROBABILITY_COLUMNS = {
     *[f"prob_recovered_lag_{w}w" for w in LAG_WEEKS],
-    *[f"prob_recovered_rolling_{w}w" for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG]
+    *[f"prob_recovered_rolling_{w}w" for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG],
     *[f"prob_recovered_ewma_{a}" for a in EWMA_ALPHAS]
-)
+}
 
 RECOVERY_RATE_CLF_FEATURE_COLUMNS = (
     _GL_COMPOSITION_COLS        |
@@ -219,8 +224,8 @@ RECOVERY_RATE_CLF_FEATURE_COLUMNS = (
     _TEMPORAL_SITE_CONTEXT_COLS |
     _CALENDAR_COLS              |
     _TEMPORAL_COMPOSITION_COLS  |
-    _TEMPORAL_VOLUME_COLS       |
-    _TEMPORAL_PROBABILITY_COLS
+    _TEMPORAL_VOLUME_COLUMNS    |
+    _TEMPORAL_PROBABILITY_COLUMNS
 )
 
 RECOVERY_RATE_CLF_DEFAULT_PARAMS = {
@@ -239,7 +244,16 @@ RECOVERY_RATE_CLF_DEFAULT_PARAMS = {
 # RECOVERY RATE REGRESSOR CONFIG
 # =====================================
 
-# RECOVERY_RATE_REG_FEATURE_COLUMNS = RECOVERY_RATE_CLF_FEATURE_COLUMNS + _BASELINE_COLS
+# these are calculated in the training step and directly attached to the model
+# NOTE: Should eventually perform train-test split and baseline calculation as its own
+#       step between the preprocessing and training pipeline steps; calculation of
+#       baselines could then either be a part of this new step or its own step
+#       altogether.
+#       If we really want to be able to load the model + baseline metrics without
+#       reloading and recalculating from preprocessed data then, the baselines should be
+#       written to their own file(s) rather than attached to the model Python object.
+_BASELINE_RECOVERY_RATE_REG_COLUMNS = {"site_gl_mean_rate", "site_gl_std_rate", "site_gl_n_nonzero_weeks"}
+RECOVERY_RATE_REG_FEATURE_COLUMNS = RECOVERY_RATE_CLF_FEATURE_COLUMNS | _BASELINE_RECOVERY_RATE_REG_COLUMNS
 RECOVERY_RATE_REG_DEFAULT_PARAMS = {
     "max_depth": 6,
     "learning_rate": 0.05,
@@ -255,46 +269,116 @@ RECOVERY_RATE_REG_DEFAULT_PARAMS = {
 # RECOVERY TYPE SHARE REGRESSORS CONFIG
 # =====================================
 
-
-
-_TEMPORAL_PER_CHANNEL_GL_COLS: list[str] = (
-    [
+_TEMPORAL_PER_CHANNEL_GL_COLS = {
+    *[
         f"prob_{ch}_lag_{w}w"
-        for ch in CONSOLIDATED_RECOVERY_TYPES
-        for w in [1, 4, 12, 13, 52]
-        if ch != ConsolidatedRecoveryTypes.SALES
-    ]
-    + [
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for w in LAG_WEEKS
+    ],
+    *[
         f"prob_{ch}_rolling_{w}w"
-        for ch in CONSOLIDATED_RECOVERY_TYPES
-        for w in [4, 12, 26, 52]
-        if ch != ConsolidatedRecoveryTypes.SALES
-    ]
-    + [
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG
+    ],
+    *[
         f"prob_{ch}_ewma_{a}"
-        for ch in CONSOLIDATED_RECOVERY_TYPES
-        for a in ["5a", "1a"]
-        if ch != ConsolidatedRecoveryTypes.SALES
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for a in EWMA_ALPHAS
     ]
-)
+}
 
 _TEMPORAL_PER_CHANNEL_SITE_COLS: list[str] = (
     [
         f"site_prob_{ch}_week_lag_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [1, 4, 12, 13, 52]
-    ]
-    + [
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for w in LAG_WEEKS
+    ],
+    *[
         f"site_prob_{ch}_week_rolling_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [4, 12, 26, 52]
-    ]
-    + [
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG
+    ],
+    *[
         f"site_prob_{ch}_week_ewma_{a}"
-        for ch in _CHANNEL_SHORT_NAMES
-        for a in ["5a", "1a"]
+        for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+        for a in EWMA_ALPHAS
     ]
 )
+
+_BASELINE_PER_TYPE_REG_COLUMNS = {"baseline_share_mean", "baseline_share_std", "baseline_share_count"}
+
+PER_TYPE_REG_FEATURE_COLUMNS = (
+    _GL_COMPOSITION_COLS            |
+    _GL_VOLUME_COLS                 |
+    _GL_AT_SITE_COLS                |
+    _SITE_CONTEXT_COLS              |
+    _TEMPORAL_SITE_CONTEXT_COLS     |
+    _CALENDAR_COLS                  |
+    _TEMPORAL_COMPOSITION_COLS      |
+    _TEMPORAL_VOLUME_COLUMNS        |
+    _TEMPORAL_PROBABILITY_COLUMNS   |
+    _TEMPORAL_PER_CHANNEL_GL_COLS   |
+    _TEMPORAL_PER_CHANNEL_SITE_COLS |
+    _BASELINE_PER_TYPE_REG_COLUMNS
+)
+
+PER_TYPE_TARGET_COLUMN_DICT = {
+    consolidated_recovery_type: f"prob_{consolidated_recovery_type}"
+    for consolidated_recovery_type in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
+}
+
+PER_TYPE_REG_DEFAULT_PARAMS_DICT = {
+    ConsolidatedRecoveryTypes.DONATIONS: {
+        "max_depth": 8,
+        "learning_rate": 0.010233524192808544,
+        "subsample": 0.6618100158148682,
+        "colsample_bytree": 0.4103116901613753,
+        "min_child_weight": 29,
+        "gamma": 2.1717813587820562,
+        "reg_alpha": 7.587120682342036,
+        "reg_lambda": 1.2536269325652274e-08,
+    },
+    ConsolidatedRecoveryTypes.LIQUIDATIONS: {
+        "max_depth": 8,
+        "learning_rate": 0.10154216570970824,
+        "subsample": 0.8222127978469346,
+        "colsample_bytree": 0.49571853898410817,
+        "min_child_weight": 22,
+        "gamma": 0.033121217751713956,
+        "reg_alpha": 0.00014422243561458065,
+        "reg_lambda": 0.03187847480686257,
+    },
+    ConsolidatedRecoveryTypes.RETURN_TO_VENDOR: {
+        "max_depth": 8,
+        "learning_rate": 0.1943881912272435,
+        "subsample": 0.9182630131548245,
+        "colsample_bytree": 0.40022527720500706,
+        "min_child_weight": 17,
+        "gamma": 2.5072850771118342,
+        "reg_alpha": 9.113338418294182e-07,
+        "reg_lambda": 0.05392398582308144,
+    },
+    ConsolidatedRecoveryTypes.WAREHOUSE_DEALS_AND_GR: {
+        "max_depth": 6,
+        "learning_rate": 0.10597071455010725,
+        "subsample": 0.7774552662295606,
+        "colsample_bytree": 0.40043799848796335,
+        "min_child_weight": 41,
+        "gamma": 2.9575883549786286,
+        "reg_alpha": 0.0008500602063823264,
+        "reg_lambda": 0.105063075386338,
+    },
+    ConsolidatedRecoveryTypes.DISPOSAL: {
+        "max_depth":        8,
+        "learning_rate":    0.10303364894496688,
+        "subsample":        0.7949352732615969,
+        "colsample_bytree": 0.4266733762096135,
+        "min_child_weight": 27,
+        "gamma":            1.9174437521560582,
+        "reg_alpha":        1.8970289690794687,
+        "reg_lambda":       0.047716386888,
+    },
+}
 
 
 # ============================================================
@@ -346,13 +430,13 @@ PREPROCESSED_RECOVERY_DATA_PARQUET = PROCESSED_DATA_DIR/"preprocessed_recovery_d
 MODEL_DIR = ROOT_DIR/"model"
 
 # how likely to enter the recovery funnel?
-ENTER_RECOVERY_FUNNEL_CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"  # classifies sale vs. non-sale outcome
-ENTER_RECOVERY_FUNNEL_REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"      # regressor for propensity for non-sale conditioned on P(Sale) < 1
+RECOVERY_RATE_CLF_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_classification_model.joblib"  # classifies sale vs. non-sale outcome
+RECOVERY_RATE_REG_MODEL_JOBLIB = MODEL_DIR/"tuned_xgboost_regression_model.joblib"      # regressor for propensity for non-sale conditioned on P(Sale) < 1
 
 # conditioned on entering recovery funnel, how likely is each (non-sale) outcome?
-RECOVERY_CHANNEL_MODEL_DIR = MODEL_DIR/"recovery_channel_share_softmax"
+PER_TYPE_REG_MODEL_DIR = MODEL_DIR/"recovery_channel_share_softmax"
 RECOVERY_CHANNEL_MODEL_JOBLIB_DICT = {
-    consolidated_recovery_type: RECOVERY_CHANNEL_MODEL_DIR/f"prob_{consolidated_recovery_type}_share.joblib"
+    consolidated_recovery_type: PER_TYPE_REG_MODEL_DIR/f"prob_{consolidated_recovery_type}_share.joblib"
     for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
 }
 

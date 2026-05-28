@@ -1,164 +1,153 @@
 # standard
 import logging
-import math
-import tempfile
 
 # third-party
-import boto3
-import joblib
 import numpy as np
 import optuna
 import pandas as pd
 import polars as pl
 from optuna.integration import XGBoostPruningCallback
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
 # local
-from src.config import ContextKeys, S3_BUCKET, SHARE_MODELS_S3_PREFIX, DEFAULT_TRAIN_YEARS, DEFAULT_TEST_YEARS, CONSOLIDATED_RECOVERY_TYPES, ConsolidatedRecoveryTypes, CATEGORICAL_COLUMNS
+from src.config import (
+    RecoverySchema,
+    RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES,
+    CATEGORICAL_COLUMNS, PER_TYPE_REG_FEATURE_COLUMNS,
+    RECOVERY_RATE_TARGET_COLUMN, PER_TYPE_TARGET_COLUMN_DICT,
+    PER_TYPE_REG_DEFAULT_PARAMS_DICT,
+    ContextKeys
+)
 from src.pipeline import Context, enforce
 from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
-from src.util import cast_categoricals, load_joblib_from_s3, write_joblib_to_s3
+from src.util import cast_categoricals, load_joblib_from_s3, write_joblib_to_s3, S3Path
+
 
 logger = logging.getLogger(__name__)
 
-
 # ============================================================
-# Channel + feature constants
+# Pipeline step
 # ============================================================
 
-RECOVERY_CHANNELS: list[str] = [
-    "prob_donations",
-    "prob_liquidations",
-    "prob_return_to_vendor",
-    "prob_warehouse_deals_and_gr",
-    "prob_disposal",
-]
+@enforce({
+    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from_key makes it optional
+    ContextKeys.SHARE_MODELS: Sequence(Defines(strict=True), Locks(strict=True)),
+})
+class TrainPerChannelShareRegressors(PipelineStep):
+    """Pipeline step that trains (and optionally tunes) the Stage 3 per-channel share regressors.
 
-# Short channel names used to construct per-channel temporal feature names.
-_CHANNEL_SHORT_NAMES: list[str] = list(CONSOLIDATED_RECOVERY_TYPES) - set([ConsolidatedRecoveryTypes.SALES])
+    For each of the 5 consolidated recovery channels, fits an XGBRegressor on
+    logit(share) where share = prob_<channel> / prob_recovered, on rows with
+    prob_recovered > 0. When tune=True, a separate Optuna study is run per
+    channel; when tune=False, the baked-in _DEFAULT_CHANNEL_PARAMS are used.
 
-_TEMPORAL_PER_CHANNEL_GL_COLS: list[str] = (
-    [
-        f"prob_{ch}_lag_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [1, 4, 12, 13, 52]
-    ]
-    + [
-        f"prob_{ch}_rolling_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [4, 12, 26, 52]
-    ]
-    + [
-        f"prob_{ch}_ewma_{a}"
-        for ch in _CHANNEL_SHORT_NAMES
-        for a in ["5a", "1a"]
-    ]
-)
+    When load_from is provided, all 5 models are loaded from S3 and no training occurs.
 
-_TEMPORAL_PER_CHANNEL_SITE_COLS: list[str] = (
-    [
-        f"site_prob_{ch}_week_lag_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [1, 4, 12, 13, 52]
-    ]
-    + [
-        f"site_prob_{ch}_week_rolling_{w}w"
-        for ch in _CHANNEL_SHORT_NAMES
-        for w in [4, 12, 26, 52]
-    ]
-    + [
-        f"site_prob_{ch}_week_ewma_{a}"
-        for ch in _CHANNEL_SHORT_NAMES
-        for a in ["5a", "1a"]
-    ]
-)
+    Each trained model carries `site_gl_baseline_`, `channel_`, and `metrics_`
+    so that downstream inference can recover everything from the single artifact
+    Trained models are saved to S3 under save_to (one .joblib per channel) and stored
+    in context under ContextKeys.SHARE_MODELS as a dict keyed by channel name.
 
-# Base features. Per-channel temporal columns are filtered against the actual
-# frame schema at train time since some can be missing upstream.
-_BASE_FEATURE_COLS: list[str] = (
-    _GL_COMPOSITION_COLS
-    + _GL_VOLUME_COLS
-    + _GL_AT_SITE_COLS
-    + _SITE_CONTEXT_COLS
-    + _TEMPORAL_SITE_CONTEXT_COLS
-    + _CALENDAR_COLS
-    + _TEMPORAL_COMPOSITION_COLS
-    + _TEMPORAL_VOLUME_COLS
-    + _TEMPORAL_PROBABILITY_COLS
-    + _TEMPORAL_PER_CHANNEL_GL_COLS
-    + _TEMPORAL_PER_CHANNEL_SITE_COLS
-)
+    Softmax normalisation across channels and combination with the Stage-1
+    p_recovered_hat prediction happen at inference, not in this step.
+    """
 
-_BASELINE_COLS: list[str] = [
-    "baseline_share_mean", "baseline_share_std", "baseline_share_count",
-]
+    def __init__(
+        self,
+        train_years,
+        test_years,
+        tune: bool = False,
+        n_trials: int = 50,
+        load_from: dict[str, S3Path] | None = None,  # consolidated_recovery_type -> joblib file
+        save_to: dict[str, S3Path] | None = None,
+    ):
+        # load from/save to should occur for all or none of the (non-sales) recovery types
+        if load_from is not None and\
+           (load_recovery_types := set(load_from.keys())) != RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES:
+            raise ValueError(
+                f"load_from keys should be recovery funnel types {RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES} "
+                f"but got {load_recovery_types}"
+            )
+        if save_to is not None and\
+           (save_recovery_types := set(save_to.keys())) != RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES:
+            raise ValueError(
+                f"save_to keys should be recovery funnel types {RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES} "
+                f"but got {save_recovery_types}"
+            )
+        if load_from is not None and save_to is not None:
+            logger.warning(f"both loading and saving model (is this intentional?): '{load_from}' -> '{save_to}'")
+        
+        self.tune = tune
+        self.n_trials = n_trials
+        self.train_years = train_years
+        self.test_years = test_years
+        self.load_from = load_from
+        self.save_to = save_to
 
-_EPS = 1e-7
+    def __call__(self, context: Context) -> Context:
+        if self.load_from is not None:
+            share_models = {}
+            for i, (consolidated_recovery_type, s3_path) in enumerate(self.load_from.items(), start=1):
+                logger.info(
+                    f"{i}/{len(RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES)} loading regression model "
+                    f"for recovery type {consolidated_recovery_type} from '{s3_path}'"
+                )
+                model = load_joblib_from_s3(s3_path)
+                logger.info(f"loaded {type(model)} object")
+                assert isinstance(model, XGBRegressor)
+                share_models[consolidated_recovery_type] = model
+        else:
+            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
 
-# Per-channel default hyperparameters from the 2026-05-14 Optuna tuning run
-# (n_trials=20 per channel, raw 9-channel data, closest raw-channel match per
-# consolidated channel).  Used when tune=False.
-_DEFAULT_CHANNEL_PARAMS: dict[str, dict] = {
-    "prob_donations": {
-        "max_depth": 8,
-        "learning_rate": 0.010233524192808544,
-        "subsample": 0.6618100158148682,
-        "colsample_bytree": 0.4103116901613753,
-        "min_child_weight": 29,
-        "gamma": 2.1717813587820562,
-        "reg_alpha": 7.587120682342036,
-        "reg_lambda": 1.2536269325652274e-08,
-    },
-    "prob_liquidations": {
-        "max_depth": 8,
-        "learning_rate": 0.10154216570970824,
-        "subsample": 0.8222127978469346,
-        "colsample_bytree": 0.49571853898410817,
-        "min_child_weight": 22,
-        "gamma": 0.033121217751713956,
-        "reg_alpha": 0.00014422243561458065,
-        "reg_lambda": 0.03187847480686257,
-    },
-    "prob_return_to_vendor": {
-        "max_depth": 8,
-        "learning_rate": 0.1943881912272435,
-        "subsample": 0.9182630131548245,
-        "colsample_bytree": 0.40022527720500706,
-        "min_child_weight": 17,
-        "gamma": 2.5072850771118342,
-        "reg_alpha": 9.113338418294182e-07,
-        "reg_lambda": 0.05392398582308144,
-    },
-    "prob_warehouse_deals_and_gr": {
-        "max_depth": 6,
-        "learning_rate": 0.10597071455010725,
-        "subsample": 0.7774552662295606,
-        "colsample_bytree": 0.40043799848796335,
-        "min_child_weight": 41,
-        "gamma": 2.9575883549786286,
-        "reg_alpha": 0.0008500602063823264,
-        "reg_lambda": 0.105063075386338,
-    },
-    "prob_disposal": {
-        "max_depth":        8,
-        "learning_rate":    0.10303364894496688,
-        "subsample":        0.7949352732615969,
-        "colsample_bytree": 0.4266733762096135,
-        "min_child_weight": 27,
-        "gamma":            1.9174437521560582,
-        "reg_alpha":        1.8970289690794687,
-        "reg_lambda":       0.047716386888,
-    },
-}
+            share_models = {}
+            for i, consolidated_recovery_type in enumerate(RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES, start=1):
+                logger.info(
+                    "[%d/%d] Training share regressor for channel '%s'",
+                    i, len(RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES), consolidated_recovery_type,
+                )
 
+                X_train, X_test, y_train, y_test, site_gl_baseline = (
+                    _build_channel_splits(
+                        df,
+                        target_col=PER_TYPE_TARGET_COLUMN_DICT[consolidated_recovery_type],
+                        train_years=self.train_years,
+                        test_years=self.test_years
+                    )
+                )
 
+                if self.tune:
+                    best_params = _tune_with_optuna(
+                        X_train, X_test, y_train, y_test,
+                        n_trials=self.n_trials,
+                        channel=consolidated_recovery_type,
+                    )
+                else:
+                    best_params = PER_TYPE_REG_DEFAULT_PARAMS_DICT[consolidated_recovery_type]
+
+                model = _train_final_model(
+                    X_train, X_test, y_train, y_test, best_params,
+                )
+                model.site_gl_baseline_ = site_gl_baseline
+                model.channel_ = consolidated_recovery_type
+
+                if self.save_to is not None:
+                    write_joblib_to_s3(model, self.save_to[consolidated_recovery_type])
+
+                share_models[consolidated_recovery_type] = model
+
+        context[ContextKeys.SHARE_MODELS] = share_models
+        context.lock(ContextKeys.SHARE_MODELS)
+
+        return context
 
 
 # ============================================================
 # Transform helpers
 # ============================================================
+
+_EPS = 1e-7
 
 def _logit(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, _EPS, 1 - _EPS)
@@ -191,15 +180,10 @@ def _polars_to_pandas_safe(df: pl.DataFrame) -> pd.DataFrame:
 # Per-channel split + baseline
 # ============================================================
 
-def _resolve_feature_cols(df: pl.DataFrame) -> list[str]:
-    available = set(df.columns)
-    return [c for c in _BASE_FEATURE_COLS if c in available]
-
-
 def _compute_site_gl_share_baseline(df_train_nz: pl.DataFrame) -> pl.DataFrame:
     return (
         df_train_nz
-        .group_by(["hashed_fc", "gl_product_group"])
+        .group_by([RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP])
         .agg([
             pl.col("_share").mean().alias("baseline_share_mean"),
             pl.col("_share").std().alias("baseline_share_std"),
@@ -212,45 +196,43 @@ def _build_channel_splits(
     df: pl.DataFrame,
     target_col: str,
     train_years: list[int],
-    test_years: list[int],
-    feature_cols: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, pl.DataFrame, list[str]]:
+    test_years: list[int]
+) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray, np.ndarray, pl.DataFrame]:
     """Filter to recovered subset, build per-channel share + baseline, return matrices."""
     df_train_nz = (
         df
-        .filter(pl.col("year").is_in(train_years))
-        .filter(pl.col("prob_recovered") > 0)
-        .with_columns((pl.col(target_col) / pl.col("prob_recovered")).alias("_share"))
+        .filter(pl.col(RecoverySchema.YEAR).is_in(train_years))
+        .filter(pl.col(RECOVERY_RATE_TARGET_COLUMN) > 0)
+        .with_columns((pl.col(target_col) / pl.col(RECOVERY_RATE_TARGET_COLUMN)).alias("_share"))
     )
     df_test_nz = (
         df
-        .filter(pl.col("year").is_in(test_years))
-        .filter(pl.col("prob_recovered") > 0)
-        .with_columns((pl.col(target_col) / pl.col("prob_recovered")).alias("_share"))
+        .filter(pl.col(RecoverySchema.YEAR).is_in(test_years))
+        .filter(pl.col(RECOVERY_RATE_TARGET_COLUMN) > 0)
+        .with_columns((pl.col(target_col) / pl.col(RECOVERY_RATE_TARGET_COLUMN)).alias("_share"))
     )
 
     site_gl_baseline = _compute_site_gl_share_baseline(df_train_nz)
 
     df_train_nz = df_train_nz.join(
-        site_gl_baseline, on=["hashed_fc", "gl_product_group"], how="left"
+        site_gl_baseline, on=[RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP], how="left"
     )
     df_test_nz = df_test_nz.join(
-        site_gl_baseline, on=["hashed_fc", "gl_product_group"], how="left"
+        site_gl_baseline, on=[RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP], how="left"
     )
 
-    aug_features = [c for c in feature_cols + _BASELINE_COLS if c in df_train_nz.columns]
-
-    X_train = cast_categoricals(_polars_to_pandas_safe(df_train_nz.select(aug_features)), CATEGORICAL_COLUMNS)
-    X_test  = cast_categoricals(_polars_to_pandas_safe(df_test_nz.select(aug_features)), CATEGORICAL_COLUMNS)
+    features = tuple(PER_TYPE_REG_FEATURE_COLUMNS - {target_col})
+    X_train = cast_categoricals(_polars_to_pandas_safe(df_train_nz.select(features)), CATEGORICAL_COLUMNS)
+    X_test  = cast_categoricals(_polars_to_pandas_safe(df_test_nz.select(features)), CATEGORICAL_COLUMNS)
 
     y_train = df_train_nz["_share"].to_numpy()
     y_test  = df_test_nz["_share"].to_numpy()
 
     logger.info(
-        "Channel '%s' splits: train_nz=%d (%s), test_nz=%d (%s), aug_features=%d",
-        target_col, len(df_train_nz), train_years, len(df_test_nz), test_years, len(aug_features),
+        "Channel '%s' splits: train_nz=%d (%s), test_nz=%d (%s)",
+        target_col, len(df_train_nz), train_years, len(df_test_nz), test_years,
     )
-    return X_train, X_test, y_train, y_test, site_gl_baseline, aug_features
+    return X_train, X_test, y_train, y_test, site_gl_baseline
 
 
 # ============================================================
@@ -314,7 +296,7 @@ def _train_final_model(
     y_train: np.ndarray,
     y_test: np.ndarray,
     best_params: dict,
-) -> tuple[XGBRegressor, dict]:
+) -> XGBRegressor:
     y_train_lg = _logit(y_train)
     y_test_lg  = _logit(y_test)
 
@@ -343,142 +325,3 @@ def _train_final_model(
         model.fit(X_train, y_train_lg, verbose=False)
 
     return model
-
-
-def _save_model_to_s3(model: XGBRegressor, bucket: str, key: str) -> None:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            joblib.dump(model, fp)
-            fp.seek(0)
-            s3_client.put_object(Body=fp.read(), Bucket=bucket, Key=key)
-            logger.info("Channel-share model saved to s3://%s/%s", bucket, key)
-    except Exception:
-        logger.exception("Failed to save channel-share model to s3://%s/%s", bucket, key)
-        raise
-
-
-def _load_model_from_s3(bucket: str, key: str) -> XGBRegressor:
-    s3_client = boto3.client("s3")
-    try:
-        with tempfile.TemporaryFile() as fp:
-            s3_client.download_fileobj(bucket, key, fp)
-            fp.seek(0)
-            model = joblib.load(fp)
-            if not isinstance(model, XGBRegressor):
-                raise ValueError(f"Object loaded from s3://{bucket}/{key} is not an XGBRegressor")
-            logger.info("Channel-share model loaded from s3://%s/%s", bucket, key)
-            return model
-    except Exception:
-        logger.exception("Failed to load channel-share model from s3://%s/%s", bucket, key)
-        raise
-
-
-# ============================================================
-# Pipeline step
-# ============================================================
-
-@enforce({
-    # ContextKeys.DF_RECOVERY_PREPROCESSED: Requires(),  # not enforced; read_from_key makes it optional
-    ContextKeys.SHARE_MODELS: Sequence(Defines(strict=True), Locks(strict=True)),
-})
-class TrainPerChannelShareRegressors(PipelineStep):
-    """Pipeline step that trains (and optionally tunes) the Stage 3 per-channel share regressors.
-
-    For each of the 4 consolidated recovery channels, fits an XGBRegressor on
-    logit(share) where share = prob_<channel> / prob_recovered, on rows with
-    prob_recovered > 0. When tune=True, a separate Optuna study is run per
-    channel; when tune=False, the baked-in _DEFAULT_CHANNEL_PARAMS are used.
-
-    When read_from_key is provided, all 4 models are loaded from S3 using
-    read_from_key as the prefix (e.g. "model/recovery_channel_share_softmax")
-    and no training occurs.
-
-    Each trained model carries `site_gl_baseline_`, `aug_features_`, `channel_`,
-    and `metrics_` so that downstream inference can recover everything from the
-    single artifact. Trained models are saved to S3 under save_to_prefix
-    (one .joblib per channel) and stored in context under
-    ContextKeys.SHARE_MODELS as a dict keyed by channel name.
-
-    Softmax normalisation across channels and combination with the Stage-1
-    p_recovered_hat prediction happen at inference, not in this step.
-    """
-
-    def __init__(
-        self,
-        tune: bool = False,
-        n_trials: int = 50,
-        train_years: list[int] | None = None,
-        test_years: list[int] | None = None,
-        read_from_key: str | None = None,
-        save_to_prefix: str | None = None,
-    ):
-        self.tune = tune
-        self.n_trials = n_trials
-        self.train_years = train_years if train_years is not None else DEFAULT_TRAIN_YEARS
-        self.test_years = test_years if test_years is not None else DEFAULT_TEST_YEARS
-        self.read_from_key = read_from_key
-        self.save_to_prefix = save_to_prefix or SHARE_MODELS_S3_PREFIX
-
-    def __call__(self, context: Context) -> Context:
-        if self.read_from_key is not None:
-            prefix = self.read_from_key.rstrip("/")
-            share_models: dict[str, XGBRegressor] = {}
-            for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
-                logger.info(
-                    "[%d/%d] Loading pre-trained share model for channel '%s'",
-                    i, len(RECOVERY_CHANNELS), channel,
-                )
-                share_models[channel] = _load_model_from_s3(S3_BUCKET, f"{prefix}/{channel}_share.joblib")
-        else:
-            df = context[ContextKeys.DF_RECOVERY_PREPROCESSED]
-
-            feature_cols = _resolve_feature_cols(df)
-            logger.info(
-                "Per-channel share regressor: %d / %d base features resolved against frame schema",
-                len(feature_cols), len(_BASE_FEATURE_COLS),
-            )
-
-            share_models = {}
-            save_prefix = self.save_to_prefix.rstrip("/")
-            for i, channel in enumerate(RECOVERY_CHANNELS, start=1):
-                logger.info(
-                    "[%d/%d] Training share regressor for channel '%s'",
-                    i, len(RECOVERY_CHANNELS), channel,
-                )
-
-                X_train, X_test, y_train, y_test, site_gl_baseline, aug_features = (
-                    _build_channel_splits(
-                        df,
-                        target_col=channel,
-                        train_years=self.train_years,
-                        test_years=self.test_years,
-                        feature_cols=feature_cols,
-                    )
-                )
-
-                if self.tune:
-                    best_params = _tune_with_optuna(
-                        X_train, X_test, y_train, y_test,
-                        n_trials=self.n_trials,
-                        channel=channel,
-                    )
-                else:
-                    best_params = _DEFAULT_CHANNEL_PARAMS[channel]
-
-                model = _train_final_model(
-                    X_train, X_test, y_train, y_test, best_params,
-                )
-                model.site_gl_baseline_ = site_gl_baseline
-                model.aug_features_ = aug_features
-                model.channel_ = channel
-
-
-                _save_model_to_s3(model, S3_BUCKET, f"{save_prefix}/{channel}_share.joblib")
-
-                share_models[channel] = model
-
-        context[ContextKeys.SHARE_MODELS] = share_models
-        context.lock(ContextKeys.SHARE_MODELS)
-
-        return context

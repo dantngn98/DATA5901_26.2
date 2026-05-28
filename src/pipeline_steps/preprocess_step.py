@@ -11,8 +11,9 @@ import polars as pl
 # local
 from src.config import (
     RecoverySchema,
-    RecoveryTypes, RECOVERY_TYPES_TO_KEEP, CONSOLIDATED_RECOVERY_TYPE_DICT, CONSOLIDATED_RECOVERY_TYPES, CONSOLIDATED_RECOVERY_TYPE_DICT, ConsolidatedRecoveryTypes,
     NORMALIZED_MACRO_CATEGORY_DICT, NORMALIZED_PRODUCT_TYPES_DICT,
+    RECOVERY_TYPES_TO_KEEP,
+    ConsolidatedRecoveryTypes, CONSOLIDATED_RECOVERY_TYPES, CONSOLIDATED_RECOVERY_TYPE_DICT,
     LAG_WEEKS, ROLLING_WEEKS, ROLLING_WEEKS_LONG, EWMA_ALPHAS,
     ContextKeys
 )
@@ -43,18 +44,18 @@ class Preprocess(PipelineStep):
 
     def __init__(
             self,
-            read_from: str | PathLike[str] | None = None,  # 
+            load_from: str | PathLike[str] | None = None,  # 
             save_to: str | PathLike[str] | None = None
         ):
-        if read_from is not None and save_to is not None:
-            logger.warning(f"both reading and writing preprocessed data (is this intentional?): '{read_from}' -> '{save_to}'")
-        self.read_from = read_from
+        if load_from is not None and save_to is not None:
+            logger.warning(f"both loading and saving preprocessed data (is this intentional?): '{load_from}' -> '{save_to}'")
+        self.load_from = load_from
         self.save_to = save_to
     
     def __call__(self, context: Context) -> Context:
-        if self.read_from is not None:  # read saved preprocessed data if provided
-            logger.info(f"loading preprocessed data from '{self.read_from}'")
-            df_recovery = load_dataframe(self.read_from)
+        if self.load_from is not None:  # read saved preprocessed data if provided
+            logger.info(f"loading preprocessed data from '{self.load_from}'")
+            df_recovery = load_dataframe(self.load_from)
         else:  # otherwise process the raw data from the Load step
             logger.info("preprocessing data from Load step")
             df_recovery = (
@@ -90,11 +91,12 @@ class Preprocess(PipelineStep):
             )
         
         if ContextKeys.DF_RECOVERY_LOADED in context:  # clean up raw loaded data if exists
+            context.unlock(ContextKeys.DF_RECOVERY_LOADED, strict=False)
             del context[ContextKeys.DF_RECOVERY_LOADED]
         
-        if self.save_to is not None and self.save_to != self.read_from:  # write preprocessed data (note that the equality check doesn't fully check path equality)
+        if self.save_to is not None:  # write preprocessed data
             logger.info(f"saving preprocessed data to '{self.save_to}'")
-            write_dataframe(df_recovery)
+            write_dataframe(df_recovery, self.save_to)
         
         context[ContextKeys.DF_RECOVERY_PREPROCESSED] = df_recovery
         context.lock(ContextKeys.DF_RECOVERY_PREPROCESSED)
@@ -139,7 +141,7 @@ def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
 
     # create target variable
     df = df.with_columns(
-        pl.when(pl.col(RecoverySchema.RECOVERY_TYPE) == RecoveryTypes.SALES)
+        pl.when(pl.col(RecoverySchema.RECOVERY_TYPE) == ConsolidatedRecoveryTypes.SALES)
         .then(pl.lit(0))
         .otherwise(pl.lit(1))
         .alias("recovery")
@@ -175,7 +177,7 @@ def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
 
     return df
     
-def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
+def _aggregation(df: pl.DataFrame, groupby: str | list[str]) -> pl.DataFrame:
     return (
         df
         .group_by(groupby)
@@ -210,14 +212,14 @@ def _aggregation(df: pl.DataFrame, groupby: list[str]) -> pl.DataFrame:
             ).values(),
             _conditional_sum(  # units_recovered (i.e., units not sold)
                 filter_col=RecoverySchema.RECOVERY_TYPE,
-                filter_value=RecoveryTypes.SALES,
+                filter_value=ConsolidatedRecoveryTypes.SALES,
                 sum_col="units",
                 alias="units_recovered",
                 comparator=ne
             ),
             *_conditional_sums(  # units_sales, units_return_to_vendor, ...
                 filter_col=RecoverySchema.RECOVERY_TYPE,
-                filter_value_to_str=CONSOLIDATED_RECOVERY_TYPE_DICT,
+                filter_value_to_str={t: t for t in CONSOLIDATED_RECOVERY_TYPES},  # we use consolidated names after pre-cleaning
                 sum_col=RecoverySchema.UNITS,
                 alias_prefix="units"
             ).values(),
@@ -233,7 +235,7 @@ def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
         *[
             _safe_division(f"units_{c}", "units_total", f"share_{c}")
             for c in list(NORMALIZED_MACRO_CATEGORY_DICT.values()) +
-                     list(NORMALIZED_PRODUCT_TYPES_DICT.values) +
+                     list(NORMALIZED_PRODUCT_TYPES_DICT.values()) +
                      ["hazmat"]
         ],
 
@@ -247,20 +249,18 @@ def _unit_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
 
 def _recovery_distribution_features(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns([
-        _safe_division("units_sales", "units_recovered", "share_sales"),  # |Sales|/|~Sales|
         *[  # share_return_to_vendor, share_warehouse_deals_and_g, share_donations, share_liquidations, share_disposal
             # (e.g., share_return_to_vendor = P(Return to Vendor | ~Sale))
             _safe_division(f"units_{consolidated_recovery_type}", "units_recovered", f"share_{consolidated_recovery_type}")
             for consolidated_recovery_type in CONSOLIDATED_RECOVERY_TYPES
-            if consolidated_recovery_type != ConsolidatedRecoveryTypes.SALES
         ]
     ])
 
 def _iso_week(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(
-        pl.date(pl.col(RecoverySchema.YEAR), 1, 4)  # TODO: what is this?
-        .dt.truncate("1w")
-        .dt.offset_by(
+        pl.date(pl.col(RecoverySchema.YEAR), 1, 4)  # first ISO week always contains Jan 4th
+        .dt.truncate("1w")                          # truncate to the Monday of that week
+        .dt.offset_by(                              # week w = week 1 shifted by (w-1) weeks
             (pl.col(RecoverySchema.WEEK).cast(pl.Int32) - 1).cast(pl.Utf8) + "w"
         )
         .alias("week_date")
@@ -399,6 +399,7 @@ def _post_cleaning(df: pl.DataFrame) -> pl.DataFrame:
     ...
 
 
+# e.g., SUM(sum_col WHERE filter_col = filter_value)
 def _conditional_sum(
     filter_col: str,
     filter_value: Any,
@@ -414,6 +415,7 @@ def _conditional_sum(
         .alias(alias)
     )
 
+# e.g., units_retail = SUM(units WHERE MACRO_CATEGORY = "RETAIL"), units_fba = SUM(units WHERE MACRO_CATEGORY = "FBA"), ...
 def _conditional_sums(
       filter_col: str,
       filter_value_to_str: dict[Any, str],  # value -> string representation for column

@@ -11,8 +11,9 @@ from xgboost import XGBRegressor
 
 # local
 from src.config import (
-    CATEGORICAL_COLUMNS,
-    RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_REG_DEFAULT_PARAMS,
+    RecoverySchema,
+    CATEGORICAL_COLUMNS, RECOVERY_RATE_REG_FEATURE_COLUMNS, RECOVERY_RATE_REG_DEFAULT_PARAMS,
+    RECOVERY_RATE_TARGET_COLUMN,
     ContextKeys
 )
 from src.pipeline import Context, enforce
@@ -20,21 +21,8 @@ from src.pipeline.conditions import Defines, Locks, Sequence
 from src.pipeline.types import PipelineStep
 from src.util import cast_categoricals, load_joblib_from_s3, write_joblib_to_s3, S3Path
 
+
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# Constants
-# ============================================================
-
-_BASELINE_COLS: list[str] = [
-    "site_gl_mean_rate",
-    "site_gl_std_rate",
-    "site_gl_n_nonzero_weeks",
-]
-
-_EXTENDED_FEATURE_COLS: list[str] = RECOVERY_RATE_CLF_FEATURE_COLUMNS + _BASELINE_COLS
-
-_EPS = 1e-6
 
 # ============================================================
 # Pipeline step
@@ -62,22 +50,25 @@ class TrainRegressor(PipelineStep):
         n_trials: int = 50,
         holdout_frac: float = 0.05,
         holdout_seed: int = 42,
-        read_from: S3Path | None = None,
+        load_from: S3Path | None = None,
         save_to: S3Path | None = None,
     ):
+        if load_from is not None and save_to is not None:
+            logger.warning(f"both loading and saving model (is this intentional?): '{load_from}' -> '{save_to}'")
+
         self.train_years = train_years
         self.test_years = test_years
         self.tune = tune
         self.n_trials = n_trials
         self.holdout_frac = holdout_frac
         self.holdout_seed = holdout_seed
-        self.read_from = read_from
+        self.load_from = load_from
         self.save_to = save_to
 
     def __call__(self, context: Context) -> Context:
-        if self.read_from_key is not None:
-            logger.info(f"loading regressor from '{self.read_from.uri}'")
-            model = load_joblib_from_s3(self.read_from)
+        if self.load_from is not None:
+            logger.info(f"loading recovery regressor from '{self.load_from.uri}'")
+            model = load_joblib_from_s3(self.load_from)
             logger.info(f"loaded {type(model)} object")
             assert isinstance(model, XGBRegressor)
         else:
@@ -106,8 +97,8 @@ class TrainRegressor(PipelineStep):
             model.site_gl_baseline_ = site_gl_baseline
             model.baseline_priors_ = priors
 
-        if self.save_to is not None and self.save_to != self.read_from:
-            logger.info(f"saving binary classifier to '{self.save_to.uri}'")
+        if self.save_to is not None:
+            logger.info(f"saving recovery regressor to '{self.save_to.uri}'")
             write_joblib_to_s3(model, self.save_to)
 
         context[ContextKeys.REG_MODEL] = model
@@ -119,6 +110,8 @@ class TrainRegressor(PipelineStep):
 # ============================================================
 # Transform helpers
 # ============================================================
+
+_EPS = 1e-6
 
 def _logit(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, _EPS, 1 - _EPS)
@@ -151,11 +144,11 @@ def _compute_weights(y: np.ndarray) -> np.ndarray:
 
 def _compute_site_gl_baseline(
     df_train_nz: pl.DataFrame,
-    target_col: str = "prob_recovered",
+    target_col: str = RECOVERY_RATE_TARGET_COLUMN,
 ) -> pl.DataFrame:
     return (
         df_train_nz
-        .group_by(["hashed_fc", "gl_product_group"])
+        .group_by([RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP])
         .agg([
             pl.col(target_col).mean().alias("site_gl_mean_rate"),
             pl.col(target_col).std().alias("site_gl_std_rate"),
@@ -166,11 +159,11 @@ def _compute_site_gl_baseline(
 
 def _build_baseline_priors(
     df_train_nz: pl.DataFrame,
-    target_col: str = "prob_recovered",
+    target_col: str = RECOVERY_RATE_TARGET_COLUMN,
 ) -> dict:
     gl_baseline = (
         df_train_nz
-        .group_by("gl_product_group")
+        .group_by(RecoverySchema.GL_PRODUCT_GROUP)
         .agg([
             pl.col(target_col).mean().alias("gl_mean_rate"),
             pl.col(target_col).std().alias("gl_std_rate"),
@@ -178,7 +171,7 @@ def _build_baseline_priors(
     )
     site_baseline = (
         df_train_nz
-        .group_by("hashed_fc")
+        .group_by(RecoverySchema.HASHED_FC)
         .agg([
             pl.col(target_col).mean().alias("site_mean_rate"),
             pl.col(target_col).std().alias("site_std_rate"),
@@ -200,13 +193,13 @@ def _holdout_site_gl_baseline(
     """Remove `holdout_frac` of site-GL pairs so XGBoost learns splits on prior-filled rows."""
     holdout_pairs = (
         site_gl_baseline
-        .select(["hashed_fc", "gl_product_group"])
+        .select([RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP])
         .sample(fraction=holdout_frac, seed=seed)
         .with_columns(pl.lit(True).alias("_held_out"))
     )
     return (
         site_gl_baseline
-        .join(holdout_pairs, on=["hashed_fc", "gl_product_group"], how="left")
+        .join(holdout_pairs, on=[RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP], how="left")
         .filter(pl.col("_held_out").is_null())
         .drop("_held_out")
     )
@@ -214,8 +207,8 @@ def _holdout_site_gl_baseline(
 
 def _fill_site_gl_baseline(df: pl.DataFrame, priors: dict) -> pl.DataFrame:
     """Fill NaN baseline cols using GL -> site -> global fallback hierarchy."""
-    df = df.join(priors["gl_baseline"], on="gl_product_group", how="left")
-    df = df.join(priors["site_baseline"], on="hashed_fc", how="left")
+    df = df.join(priors["gl_baseline"], on=RecoverySchema.GL_PRODUCT_GROUP, how="left")
+    df = df.join(priors["site_baseline"], on=RecoverySchema.HASHED_FC, how="left")
     df = df.with_columns([
         pl.coalesce([
             pl.col("site_gl_mean_rate"),
@@ -244,11 +237,11 @@ def _build_train_val_splits(
     test_years: list[int],
     holdout_frac: float,
     holdout_seed: int,
-    target_col: str = "prob_recovered",
+    target_col: str = RECOVERY_RATE_TARGET_COLUMN,
 ):
     """Filter to non-zero rows, compute and join baselines, return feature matrices."""
-    df_train = df.filter(pl.col("year").is_in(train_years))
-    df_val = df.filter(pl.col("year").is_in(test_years))
+    df_train = df.filter(pl.col(RecoverySchema.YEAR).is_in(train_years))
+    df_val = df.filter(pl.col(RecoverySchema.YEAR).is_in(test_years))
 
     df_train_nz = df_train.filter(pl.col(target_col) > 0)
     df_val_nz = df_val.filter(pl.col(target_col) > 0)
@@ -271,12 +264,12 @@ def _build_train_val_splits(
     )
 
     df_train_nz = df_train_nz.join(
-        site_gl_baseline_seen, on=["hashed_fc", "gl_product_group"], how="left"
+        site_gl_baseline_seen, on=[RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP], how="left"
     )
     df_train_nz = _fill_site_gl_baseline(df_train_nz, priors)
 
     df_val_nz = df_val_nz.join(
-        site_gl_baseline, on=["hashed_fc", "gl_product_group"], how="left"
+        site_gl_baseline, on=[RecoverySchema.HASHED_FC, RecoverySchema.GL_PRODUCT_GROUP], how="left"
     )
     n_unseen = df_val_nz.filter(pl.col("site_gl_mean_rate").is_null()).height
     logger.info(
@@ -285,8 +278,9 @@ def _build_train_val_splits(
     )
     df_val_nz = _fill_site_gl_baseline(df_val_nz, priors)
 
-    X_train = cast_categoricals(df_train_nz.select(_EXTENDED_FEATURE_COLS).to_pandas(), CATEGORICAL_COLUMNS)
-    X_val = cast_categoricals(df_val_nz.select(_EXTENDED_FEATURE_COLS).to_pandas(), CATEGORICAL_COLUMNS)
+    feature_columns = tuple(RECOVERY_RATE_REG_FEATURE_COLUMNS)
+    X_train = cast_categoricals(df_train_nz.select(feature_columns).to_pandas(), CATEGORICAL_COLUMNS)
+    X_val = cast_categoricals(df_val_nz.select(feature_columns).to_pandas(), CATEGORICAL_COLUMNS)
 
     y_train = df_train_nz[target_col].to_pandas().values
     y_val = df_val_nz[target_col].to_pandas().values
