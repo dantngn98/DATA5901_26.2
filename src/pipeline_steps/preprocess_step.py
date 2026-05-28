@@ -15,6 +15,7 @@ from src.config import (
     RECOVERY_TYPES_TO_KEEP,
     ConsolidatedRecoveryTypes, CONSOLIDATED_RECOVERY_TYPES, CONSOLIDATED_RECOVERY_TYPE_DICT,
     LAG_WEEKS, ROLLING_WEEKS, ROLLING_WEEKS_LONG, EWMA_ALPHAS,
+    RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_REG_FEATURE_COLUMNS, PER_TYPE_REG_FEATURE_COLUMNS,
     ContextKeys
 )
 from src.pipeline import Context, enforce
@@ -395,8 +396,19 @@ def _temporal_features(
     return df_full_weeks
 
 def _post_cleaning(df: pl.DataFrame) -> pl.DataFrame:
-    # TODO: select only the features used in the models
-    ...
+    # features available at end of preprocessing
+    created = df.columns
+    
+    # all features that the models use
+    used = RECOVERY_RATE_CLF_FEATURE_COLUMNS | RECOVERY_RATE_REG_FEATURE_COLUMNS | PER_TYPE_REG_FEATURE_COLUMNS
+
+    # used features that haven't been created yet
+    not_yet_created = used - created
+    logger.info(f"model features not created during preprocessing: {not_yet_created}")
+
+    return df.select(
+        tuple(created & used)
+    )
 
 
 # e.g., SUM(sum_col WHERE filter_col = filter_value)
