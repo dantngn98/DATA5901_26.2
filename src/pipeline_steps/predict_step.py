@@ -64,9 +64,9 @@ class Predict(PipelineStep):
         gl_groups: list[str] | None = None,
         years: list[int] | None = None,
         weeks: list[int] | None = None,
+        # Only set run_shap=True when the supplied dataset is small — SHAP runs
+        # on every row and is very slow on large inputs.
         run_shap: bool = True,
-        shap_n: int | None = None,
-        shap_seed: int = 0,
         save_to: str | None = None,
     ):
         self.predict_channels = predict_channels
@@ -75,8 +75,6 @@ class Predict(PipelineStep):
         self.years = years
         self.weeks = weeks
         self.run_shap = run_shap
-        self.shap_n = shap_n
-        self.shap_seed = shap_seed
         self.save_to = save_to
 
     def __call__(self, context: Context) -> Context:
@@ -107,26 +105,23 @@ class Predict(PipelineStep):
         else:
             channel_rates = {}
 
-        # 8. SHAP decomposition (optionally on a capped sample)
+        # 8. SHAP decomposition on the entire dataset
         shap_baseline_rate = np.full(len(df), np.nan)
         shap_deviation_contribution = np.full(len(df), np.nan)
 
         if self.run_shap:
-            idx = _sample_idx(len(df), self.shap_n, self.shap_seed)
-            logger.info("Running SHAP on %d / %d rows", len(idx), len(df))
+            logger.info("Running SHAP on all %d rows", len(df))
             X_clf_shap = cast_categoricals(
-                df[idx].select(tuple(RECOVERY_RATE_CLF_FEATURE_COLUMNS)).to_pandas(), CATEGORICAL_COLUMNS
+                df.select(tuple(RECOVERY_RATE_CLF_FEATURE_COLUMNS)).to_pandas(), CATEGORICAL_COLUMNS
             )
             X_reg_shap = cast_categoricals(
-                df_ext[idx].select(tuple(RECOVERY_RATE_REG_FEATURE_COLUMNS)).to_pandas(), CATEGORICAL_COLUMNS
+                df_ext.select(tuple(RECOVERY_RATE_REG_FEATURE_COLUMNS)).to_pandas(), CATEGORICAL_COLUMNS
             )
             shap_raw = _run_shap(model_clf, model_reg, X_clf_shap, X_reg_shap)
-            baseline_sample, deviation_sample = _compute_shap_decomposition(
+            shap_baseline_rate, shap_deviation_contribution = _compute_shap_decomposition(
                 shap_raw["sv_reg_values"],
                 shap_raw["sv_reg_base"],
             )
-            shap_baseline_rate[idx] = baseline_sample
-            shap_deviation_contribution[idx] = deviation_sample
 
         # 9. Assemble output DataFrame
         # Column order: identifiers -> (real -> predicted -> abs_err) per prediction group -> diagnostics
@@ -281,13 +276,6 @@ def _predict_stage3(
 # ============================================================
 # SHAP
 # ============================================================
-
-def _sample_idx(n: int, shap_n: int | None, seed: int) -> np.ndarray:
-    if shap_n is None or shap_n >= n:
-        return np.arange(n)
-    rng = np.random.default_rng(seed)
-    return np.sort(rng.choice(n, size=shap_n, replace=False))
-
 
 def _run_shap(
     model_clf,
