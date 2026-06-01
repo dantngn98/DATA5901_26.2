@@ -217,6 +217,7 @@ _TEMPORAL_PROBABILITY_COLUMNS = {
 }
 
 RECOVERY_RATE_CLF_FEATURE_COLUMNS = (
+    CATEGORICAL_COLUMNS         |
     _GL_COMPOSITION_COLS        |
     _GL_VOLUME_COLS             |
     _GL_AT_SITE_COLS            |
@@ -308,6 +309,7 @@ _TEMPORAL_PER_CHANNEL_SITE_COLS = {
 _BASELINE_PER_TYPE_REG_COLUMNS = {"baseline_share_mean", "baseline_share_std", "baseline_share_count"}
 
 PER_TYPE_REG_FEATURE_COLUMNS = (
+    CATEGORICAL_COLUMNS             |
     _GL_COMPOSITION_COLS            |
     _GL_VOLUME_COLS                 |
     _GL_AT_SITE_COLS                |
