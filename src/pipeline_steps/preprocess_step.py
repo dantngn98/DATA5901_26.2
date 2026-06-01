@@ -16,6 +16,7 @@ from src.config import (
     ConsolidatedRecoveryTypes, CONSOLIDATED_RECOVERY_TYPES, CONSOLIDATED_RECOVERY_TYPE_DICT,
     LAG_WEEKS, ROLLING_WEEKS, ROLLING_WEEKS_LONG, EWMA_ALPHAS, _YEAR_COLS,
     RECOVERY_RATE_CLF_FEATURE_COLUMNS, RECOVERY_RATE_REG_FEATURE_COLUMNS, PER_TYPE_REG_FEATURE_COLUMNS,
+    RECOVERY_RATE_TARGET_COLUMN, PER_TYPE_TARGET_COLUMN_DICT,
     ContextKeys
 )
 from src.pipeline import Context, enforce
@@ -390,8 +391,9 @@ def _post_cleaning(df: pl.DataFrame) -> pl.DataFrame:
     # features available at end of preprocessing
     created = set(df.columns)
     
-    # all features that the models use
-    used = RECOVERY_RATE_CLF_FEATURE_COLUMNS | RECOVERY_RATE_REG_FEATURE_COLUMNS | PER_TYPE_REG_FEATURE_COLUMNS | _YEAR_COLS
+    # all features + targets that the models use
+    _target_cols = {RECOVERY_RATE_TARGET_COLUMN} | set(PER_TYPE_TARGET_COLUMN_DICT.values())
+    used = RECOVERY_RATE_CLF_FEATURE_COLUMNS | RECOVERY_RATE_REG_FEATURE_COLUMNS | PER_TYPE_REG_FEATURE_COLUMNS | _YEAR_COLS | _target_cols
 
     # used features that haven't been created yet
     not_yet_created = used - created
