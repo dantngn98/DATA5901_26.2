@@ -73,7 +73,7 @@ def write_dataframe(
     if extension == "csv":
         return dataframe.write_csv(fp, separator=csv_delimiter)
     elif extension == "parquet":
-        return dataframe.write_parquet()
+        return dataframe.write_parquet(fp)
     raise ValueError(f"Unknown extension for file '{fp}'")
 
 

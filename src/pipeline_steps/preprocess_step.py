@@ -20,7 +20,7 @@ from src.config import (
 )
 from src.pipeline import Context, enforce
 from src.pipeline.types import PipelineStep
-from src.pipeline.conditions import Defines, Deletes, Locks, Sequence
+from src.pipeline.conditions import Defines, Deletes, Unlocks, Locks, Sequence, XOR
 from src.util import load_dataframe, write_dataframe
 
 
@@ -32,8 +32,11 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 @enforce({
-    # ContextKeys.DF_RECOVERY_LOADED: Requires(),           # not needed if loading from saved preprocessed data
-    ContextKeys.DF_RECOVERY_LOADED: Deletes(strict=False),  # delete if exists to free up memory
+    # ContextKeys.DF_RECOVERY_LOADED: Requires(),  # not needed if loading from saved preprocessed data
+    ContextKeys.DF_RECOVERY_LOADED: XOR(           # delete if exists to free up memory
+        Deletes(strict=False),
+        Sequence(Unlocks(strict=True), Deletes(strict=True))
+    ),  
     ContextKeys.DF_RECOVERY_PREPROCESSED: Sequence(Defines(strict=True), Locks(strict=True))
 })
 class Preprocess(PipelineStep):
@@ -45,7 +48,7 @@ class Preprocess(PipelineStep):
 
     def __init__(
             self,
-            load_from: str | PathLike[str] | None = None,  # 
+            load_from: str | PathLike[str] | None = None,
             save_to: str | PathLike[str] | None = None
         ):
         if load_from is not None and save_to is not None:
@@ -110,20 +113,8 @@ class Preprocess(PipelineStep):
 # ============================================================
 
 def _pre_cleaning(df: pl.DataFrame) -> pl.DataFrame:
-    # drop columns with all null values
-    all_null_columns = (
-        df
-        .select(pl.all().is_null().all())
-        .unpivot()
-        .filter(pl.col("value") == True)
-        .select("variable")
-        .to_series()
-        .to_list()
-    )
-    df = df.drop(all_null_columns)
-
     # filter out C-Returns and Bintools Theft
-    df = df.filter(pl.col(RecoverySchema.RECOVERY_TYPE).isin(RECOVERY_TYPES_TO_KEEP))
+    df = df.filter(pl.col(RecoverySchema.RECOVERY_TYPE).is_in(RECOVERY_TYPES_TO_KEEP))
 
     # consolidate recovery types
     df = df.with_columns(
@@ -397,7 +388,7 @@ def _temporal_features(
 
 def _post_cleaning(df: pl.DataFrame) -> pl.DataFrame:
     # features available at end of preprocessing
-    created = df.columns
+    created = set(df.columns)
     
     # all features that the models use
     used = RECOVERY_RATE_CLF_FEATURE_COLUMNS | RECOVERY_RATE_REG_FEATURE_COLUMNS | PER_TYPE_REG_FEATURE_COLUMNS

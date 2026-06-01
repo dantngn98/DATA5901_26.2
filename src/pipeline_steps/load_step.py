@@ -8,7 +8,7 @@ from src.config import ContextKeys, CSV_DELIMITER
 from src.pipeline import Context, enforce
 from src.pipeline.types import PipelineStep
 from src.pipeline.conditions import Defines, Locks, Sequence
-from src.util import load_dataframe, S3Path
+from src.util import load_dataframe
 
 
 logger = logging.getLogger(__name__)

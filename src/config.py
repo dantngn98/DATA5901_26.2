@@ -287,8 +287,8 @@ _TEMPORAL_PER_CHANNEL_GL_COLS = {
     ]
 }
 
-_TEMPORAL_PER_CHANNEL_SITE_COLS: list[str] = (
-    [
+_TEMPORAL_PER_CHANNEL_SITE_COLS = {
+    *[
         f"site_prob_{ch}_week_lag_{w}w"
         for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
         for w in LAG_WEEKS
@@ -303,7 +303,7 @@ _TEMPORAL_PER_CHANNEL_SITE_COLS: list[str] = (
         for ch in RECOVERY_FUNNEL_CONSOLIDATED_RECOVERY_TYPES
         for a in EWMA_ALPHAS
     ]
-)
+}
 
 _BASELINE_PER_TYPE_REG_COLUMNS = {"baseline_share_mean", "baseline_share_std", "baseline_share_count"}
 
