@@ -200,6 +200,7 @@ _TEMPORAL_SITE_CONTEXT_COLS = {
     *[f"site_prob_recovered_week_rolling_{w}w" for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG]
 }
 _CALENDAR_COLS = {"month", "week"}
+_YEAR_COLS = {"year"}
 _TEMPORAL_COMPOSITION_COLS = {
     *[f"share_{c}_lag_{w}w" for c in _COMPOSITION_COLUMNS for w in LAG_WEEKS],
     *[f"share_{c}_rolling_{w}w" for c in _COMPOSITION_COLUMNS for w in ROLLING_WEEKS + ROLLING_WEEKS_LONG],
